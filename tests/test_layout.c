@@ -133,6 +133,42 @@ static void test_rows(void) {
 	CHECK(out[1].x > out[0].x && out[3].x > out[2].x, "order not kept");
 }
 
+static void test_relative_sizes(void) {
+	// Same aspect ratio, different native sizes: no equal-height normalization.
+	struct layout_item items[] = {{400, 300}, {1600, 1200}};
+	struct layout_rect area = {20, 30, 1000, 600}, out[2];
+	layout_rows(items, 2, area, 24, 1, out);
+	check_invariants("relative sizes", items, 2, area, 1, 24, out);
+	// Boosts are 1.25 and 1.0, so the height ratio is 0.3125.
+	CHECK(fabs(out[0].h / out[1].h - 0.3125) < EPS,
+		"relative height %.6f", out[0].h / out[1].h);
+	CHECK(out[0].h > out[1].h * 0.25,
+		"small window did not receive a boost");
+	CHECK(fabs(out[0].y + out[0].h / 2 - out[1].y - out[1].h / 2) < EPS,
+		"single row is not vertically centered");
+}
+
+static void test_mixed_rows(void) {
+	struct layout_item items[] = {{1600, 1200}, {400, 300},
+		{1600, 1200}, {400, 300}};
+	struct layout_rect area = {0, 0, 1000, 1000}, out[4];
+	layout_rows(items, 4, area, 20, 1, out);
+	check_invariants("mixed rows", items, 4, area, 1, 20, out);
+	CHECK(out[2].y > out[0].y, "expected two rows");
+	CHECK(fabs(out[0].y + out[0].h - out[1].y - out[1].h) < EPS &&
+		fabs(out[2].y + out[2].h - out[3].y - out[3].h) < EPS,
+		"windows do not share row baselines");
+}
+
+static void test_scale_caps(void) {
+	struct layout_item items[] = {{100, 100}, {800, 600}};
+	struct layout_rect area = {0, 0, 2000, 1500}, out[2];
+	layout_rows(items, 2, area, 24, 0.75, out);
+	check_invariants("caps", items, 2, area, 0.75, 24, out);
+	CHECK(fabs(out[0].w - 75) < EPS && fabs(out[1].w - 600) < EPS,
+		"boost bypassed cap or capped windows shrank unnecessarily");
+}
+
 static void test_neighbor(void) {
 	// 3 on top, 2 below (centered)
 	struct layout_rect r[5] = {
@@ -165,6 +201,9 @@ int main(void) {
 	test_single_small();
 	test_single_large();
 	test_rows();
+	test_relative_sizes();
+	test_mixed_rows();
+	test_scale_caps();
 	test_neighbor();
 	test_degenerate();
 	test_realistic();

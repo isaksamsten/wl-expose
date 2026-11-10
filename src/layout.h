@@ -17,12 +17,13 @@ struct layout_params {
 	double max_scale; // thumbnails are never scaled above this (<= 0: no cap)
 };
 
-// Justified rows: lay out items in order into area. out has n entries.
+// Native-relative rows, with a small-window boost based on area.h, fitted with
+// a shared scale. Items stay in input order; out has n entries.
 void layout_rows(const struct layout_item *items, size_t n,
 	struct layout_rect area, double spacing, double max_scale,
 	struct layout_rect *out);
 
-// Lay out all items in input order using justified rows.
+// Lay out all items in input order using native-relative rows.
 void layout_compute(const struct layout_item *items, size_t n,
 	struct layout_rect area, const struct layout_params *params,
 	struct layout_rect *out);
