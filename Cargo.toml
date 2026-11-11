@@ -1,0 +1,17 @@
+[package]
+name = "wl-expose"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Window overview (exposé) for Wayland compositors"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# The randomized layout tests run thousands of layouts.
+[profile.test]
+opt-level = 2
+

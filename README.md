@@ -70,7 +70,7 @@ deterministic sweep clears any remaining collisions before fitting.
 - `ext_foreign_toplevel_list_v1`: window list (identifier, app_id, title)
 - `ext_foreign_toplevel_image_capture_source_manager_v1` +
   `ext_image_copy_capture_manager_v1`: live thumbnails into `wl_shm` buffers
-- `zwlr_layer_shell_v1` (vendored XML): the overlay surface
+- `zwlr_layer_shell_v1`: the overlay surface
 - `wl_subcompositor` + `wp_viewporter`: one subsurface per thumbnail, scaled
   by the compositor
 - `wp_single_pixel_buffer_manager_v1` (optional, falls back to 1x1 shm
@@ -79,11 +79,12 @@ deterministic sweep clears any remaining collisions before fitting.
 
 ## Build
 
+Written in Rust on [smithay-client-toolkit](https://github.com/Smithay/client-toolkit)
+(SCTK), with protocol bindings from `wayland-protocols`.
+
 ```sh
-meson setup build
-ninja -C build
-meson test -C build
+cargo build --release
+cargo test
 ```
 
-Requires `wayland-client`, `wayland-protocols` (>= 1.37), `wayland-scanner`,
-`xkbcommon`.
+Requires Rust 1.88 or newer and `libxkbcommon`.
