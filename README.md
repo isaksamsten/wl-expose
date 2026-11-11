@@ -26,13 +26,26 @@ ids=$(niri msg -j windows | jq -r ".[] | select(.workspace_id == $ws) | .id")
 id=$(wl-expose $ids) &&
     niri msg action focus-window --id "$id"
 ```
+Previews use natural window placement adapted from `native_win.js`: native-sized
+windows separate using aspect-aware dodges, then fit with a shared scale while
+reserving the `--gap` minimum in final logical pixels. Native size ratios are
+preserved without small-window boosts or a row fallback. Placement starts from a
+deterministic synthetic arrangement because desktop coordinates are unavailable.
+Some space is reserved for breathing room; centers spread gently and uniformly,
+preserving the composition rather than stretching it to the screen edges.
+The minimum gap is a floor, not a target to minimize. If it cannot fit the natural
+ordering even with zero-sized thumbnails, it is reduced with a warning to stderr.
+The layout is computed before display; there is no continuous physics simulation.
+If separation reaches its 500-pass limit, a warning is written to stderr and a
+deterministic sweep clears any remaining collisions before fitting.
+
 
 ## Controls
 
 - Pointer: hover selects, left click picks, a click on the background cancels.
 - Arrows / `hjkl`: move to the nearest window in that direction.
-- `Tab` / `Shift+Tab`: cycle in layout order.
-- `1`–`9`: pick the n-th window in layout order.
+- `Tab` / `Shift+Tab`: cycle in input order.
+- `1`–`9`: pick the n-th window in input order.
 - `Enter` picks, `Escape` cancels.
 
 ## Options
@@ -46,7 +59,7 @@ id=$(wl-expose $ids) &&
       --background COLOR  overlay color, RRGGBB[AA] (000000b3)
       --highlight COLOR   selection border color (4c8dffff)
       --placeholder COLOR color of windows without a thumbnail (3a3a3aff)
-      --gap PX            space between thumbnails (24)
+      --gap PX            minimum space between thumbnails (24)
       --margin PX         space around the layout (48)
       --border PX         selection border width (4)
       --max-scale F       max thumbnail scale (1.0)

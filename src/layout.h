@@ -13,7 +13,7 @@ struct layout_rect {
 };
 
 struct layout_params {
-	double spacing;   // gap between thumbnails
+	double spacing;   // minimum thumbnail gap in final logical pixels (>= 0)
 	double max_scale; // thumbnails are never scaled above this (<= 0: no cap)
 };
 
@@ -23,7 +23,12 @@ void layout_rows(const struct layout_item *items, size_t n,
 	struct layout_rect area, double spacing, double max_scale,
 	struct layout_rect *out);
 
-// Lay out all items in input order using native-relative rows.
+// Natural placement adapted from native_win.js with screen-space gap constraints.
+// Preserves native size ratios and synthetic seed ordering, with a shared scale
+// and gentle uniform center spreading instead of edge-to-edge stretching.
+// If the minimum gap cannot fit the ordering, reduces it with a stderr warning.
+// At the iteration limit, logs to stderr and sweeps away remaining collisions.
+// out[i] corresponds to items[i]; computation has no animation state.
 void layout_compute(const struct layout_item *items, size_t n,
 	struct layout_rect area, const struct layout_params *params,
 	struct layout_rect *out);

@@ -23,7 +23,7 @@ static const char usage_text[] =
 	"      --background COLOR  overlay color, RRGGBB[AA] (000000b3)\n"
 	"      --highlight COLOR   selection border color (4c8dffff)\n"
 	"      --placeholder COLOR color of windows without a thumbnail (3a3a3aff)\n"
-	"      --gap PX            space between thumbnails (24)\n"
+	"      --gap PX            minimum space between thumbnails (24)\n"
 	"      --margin PX         space around the layout (48)\n"
 	"      --border PX         selection border width (4)\n"
 	"      --max-scale F       max thumbnail scale (1.0)\n"
