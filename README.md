@@ -55,26 +55,71 @@ deterministic sweep clears any remaining collisions before fitting.
   -s, --select ID         start with this window selected (default: first ID)
       --static            capture one frame per window (default: live)
   -c, --cursors           paint cursors into thumbnails
-  -t, --timeout MS        max wait for first frames before showing (500)
-      --background COLOR  overlay color, RRGGBB[AA] (000000b3)
-      --highlight COLOR   selection border color (4c8dffff)
-      --placeholder COLOR color of windows without a thumbnail (3a3a3aff)
-      --gap PX            minimum space between thumbnails (24)
-      --margin PX         space around the layout (48)
-      --border PX         selection border width (4)
-      --max-scale F       max thumbnail scale (1.0)
+  -t, --timeout MS        max wait for window sizes before showing (500)
+      --config PATH       config file (default: see below); implies --no-daemon
+      --daemon            stay running and show the overlay for later calls
+      --no-daemon         show the overlay from this process even if a daemon runs
 ```
+
+## Daemon
+
+`wl-expose --daemon` keeps the Wayland connection, window list, config and
+decoded background image ready, so invocations skip all of that. Start it with
+the session, e.g. in niri:
+
+```kdl
+spawn-at-startup "wl-expose" "--daemon"
+```
+
+Plain `wl-expose [OPTIONS] [ID...]` then hands its request to the daemon over
+`$XDG_RUNTIME_DIR/wl-expose-$WAYLAND_DISPLAY.sock` and prints the result and exits
+exactly as before, so wrappers don't change. Without a daemon it shows the
+overlay itself. Window captures still start fresh on every show.
+
+- Calling wl-expose while the overlay is open closes it (both calls exit 1),
+  so a single key binding toggles it.
+- Killing the waiting client cancels its overlay.
+- The daemon reloads the config and image when their files change (checked
+  on each show). An invalid config is reported to the client, and the
+  previous one is kept.
+- It exits when the compositor goes away.
+
+## Configuration
+
+Appearance is read from `$XDG_CONFIG_HOME/wl-expose/config.toml` (usually
+`~/.config/wl-expose/config.toml`). A missing file means the defaults; every
+key is optional, and unknown keys are an error. Colors are `RRGGBB[AA]`, with
+or without a leading `#`.
+
+```toml
+background = "000000b3"     # overlay color; tints the image if one is set
+# background-image = "~/Pictures/wall.png"  # PNG, JPEG or WebP
+highlight = "4c8dffff"      # selection border color
+placeholder = "3a3a3aff"    # color of windows without a thumbnail
+gap = 24                    # minimum space between thumbnails, px
+margin = 48                 # space around the layout, px
+border = 4                  # selection border width, px
+max-scale = 1.0             # max thumbnail scale
+```
+
+`background-image` is scaled to cover the output (centered, cropped to keep its
+aspect ratio) by the compositor. `~/` is expanded; relative paths are relative
+to the config file. Use a fully transparent `background` (`00000000`) to show the
+image untinted. If the image cannot be loaded, a warning is printed and the plain
+color is used.
 
 ## Protocols
 
 - `ext_foreign_toplevel_list_v1`: window list (identifier, app_id, title)
 - `ext_foreign_toplevel_image_capture_source_manager_v1` +
-  `ext_image_copy_capture_manager_v1`: live thumbnails into `wl_shm` buffers
+  `ext_image_copy_capture_manager_v1`: live thumbnails, into dmabufs
+  (`zwp_linux_dmabuf_v1` v3 + GBM) when possible, otherwise `wl_shm` buffers
 - `zwlr_layer_shell_v1`: the overlay surface
 - `wl_subcompositor` + `wp_viewporter`: one subsurface per thumbnail, scaled
   by the compositor
 - `wp_single_pixel_buffer_manager_v1` (optional, falls back to 1x1 shm
-  buffers): background, highlight, placeholders
+  buffers): background, highlight, placeholders; the background image is a
+  plain `wl_shm` buffer
 - `wl_seat` + xkbcommon: input; `wp_cursor_shape_manager_v1` (optional)
 
 ## Build
@@ -87,4 +132,4 @@ cargo build --release
 cargo test
 ```
 
-Requires Rust 1.88 or newer and `libxkbcommon`.
+Requires Rust 1.88 or newer, `libxkbcommon` and `libgbm`.

@@ -19,12 +19,14 @@ use wayland_protocols::{
         image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
     },
     wp::{
+        linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
 };
 
 use crate::app::App;
+use crate::dmabuf::Dmabuf;
 
 /// User data for objects whose events are ignored (or that have none).
 pub struct Ignore;
@@ -54,6 +56,9 @@ ignore_events!(
     ExtForeignToplevelImageCaptureSourceManagerV1,
     ExtImageCaptureSourceV1,
     ExtImageCopyCaptureManagerV1,
+    // Only create_immed is used, which has no events but `failed`, and that
+    // is a protocol error instead.
+    ZwpLinuxBufferParamsV1,
 );
 
 /// wl_shm without SCTK's format tracking, which would require the state to
@@ -76,6 +81,8 @@ pub struct Globals {
     pub layer_shell: LayerShell,
     pub source_manager: ExtForeignToplevelImageCaptureSourceManagerV1,
     pub copy_manager: ExtImageCopyCaptureManagerV1,
+    /// Optional; captures fall back to shm.
+    pub dmabuf: Option<Dmabuf>,
 }
 
 impl Globals {
@@ -122,6 +129,7 @@ impl Globals {
             layer_shell: layer_shell?,
             source_manager: source_manager?,
             copy_manager: copy_manager?,
+            dmabuf: Dmabuf::bind(globals, qh),
         })
     }
 }

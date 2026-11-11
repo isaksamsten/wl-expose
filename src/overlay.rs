@@ -3,8 +3,14 @@
 //! The background, highlight and placeholders are single-pixel buffers (or
 //! 1x1 shm buffers if the compositor lacks wp_single_pixel_buffer_manager_v1)
 //! scaled with viewports; thumbnails attach the capture buffers directly and
-//! let the compositor scale them. All subsurfaces have an empty input region,
-//! so pointer events arrive on the main surface and are hit-tested here.
+//! let the compositor scale them. With a background image, the image is the
+//! main surface's buffer (cropped to cover it) and the background color is a
+//! tint subsurface above it. All subsurfaces have an empty input region, so
+//! pointer events arrive on the main surface and are hit-tested here.
+
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use smithay_client_toolkit::{
     compositor::Region,
@@ -27,13 +33,17 @@ use wayland_protocols::{
 };
 
 use crate::app::App;
+use crate::background::{self, Image};
 use crate::capture::{Capture, CaptureEvent, Frame};
-use crate::globals::{Globals, Ignore, Shm};
+use crate::config::Config;
+use crate::globals::{Globals, Ignore};
+use crate::ipc::Request;
 use crate::layout::{self, Dir};
-use crate::options::Options;
 
 /// Layout size of a window whose capture size is not known yet.
 const DEFAULT_SIZE: (f64, f64) = (800.0, 500.0);
+
+static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowId(u32);
@@ -153,17 +163,49 @@ struct Style {
     max_scale: f64,
 }
 
+/// A background image in an shm buffer, shared by every overlay of a daemon.
+pub struct Wallpaper {
+    buffer: WlBuffer,
+    width: u32,
+    height: u32,
+}
+
+impl Wallpaper {
+    pub fn new(g: &Globals, img: &Image, qh: &QueueHandle<App>) -> std::io::Result<Self> {
+        let mut pool = RawPool::new(img.data.len(), &g.shm).map_err(std::io::Error::other)?;
+        pool.mmap()[..img.data.len()].copy_from_slice(&img.data);
+        let (w, h) = (img.width as i32, img.height as i32);
+        // The buffer stays valid after the pool is destroyed (on drop).
+        let buffer =
+            pool.create_buffer(0, w, h, img.stride(), wl_shm::Format::Argb8888, Ignore, qh);
+        Ok(Self {
+            buffer,
+            width: img.width,
+            height: img.height,
+        })
+    }
+}
+
+impl Drop for Wallpaper {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
+}
+
 pub struct Overlay {
     // Field order is drop order: children before their parent surface.
     pub windows: Vec<Window>,
     pub selected: Option<usize>,
     highlight_sub: Sub,
+    /// The background color over the wallpaper; None without one.
+    tint_sub: Option<Sub>,
     viewport: WpViewport,
     layer: LayerSurface,
     background: WlBuffer,
+    wallpaper: Option<Rc<Wallpaper>>,
     highlight: WlBuffer,
     placeholder: WlBuffer,
-    g: Globals,
+    g: Rc<Globals>,
     style: Style,
 
     width: u32,
@@ -173,20 +215,24 @@ pub struct Overlay {
     mapped: bool,
     /// The first-frame timeout expired: map even without all frames.
     deadline_passed: bool,
+    /// With WL_EXPOSE_TRACE set: when the overlay was created.
+    trace: Option<Instant>,
 }
 
 impl Overlay {
     /// Create the overlay for `toplevels` (handle and identifier each), in
     /// layout order, and start capturing them.
     pub fn new(
-        g: Globals,
+        g: Rc<Globals>,
         toplevels: Vec<(ExtForeignToplevelHandleV1, String)>,
-        opts: &Options,
+        req: &Request,
+        config: &Config,
+        wallpaper: Option<Rc<Wallpaper>>,
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
-        let background = color_buffer(&g, opts.background, qh)?;
-        let highlight = color_buffer(&g, opts.highlight, qh)?;
-        let placeholder = color_buffer(&g, opts.placeholder, qh)?;
+        let background = color_buffer(&g, config.background, qh)?;
+        let highlight = color_buffer(&g, config.highlight, qh)?;
+        let placeholder = color_buffer(&g, config.placeholder, qh)?;
         // Copied by set_input_region, so it is destroyed at the end of new().
         let no_input = Region::new(&g.compositor).map_err(std::io::Error::other)?;
 
@@ -205,17 +251,24 @@ impl Overlay {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
-        // Created before the thumbnails, so it starts below all of them.
+        // Created before the thumbnails, so they start below all of them,
+        // the tint lowest.
+        let tint_sub = (wallpaper.is_some() && config.background & 0xff != 0).then(|| {
+            let sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
+            sub.attach(&background);
+            sub
+        });
         let highlight_sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
 
         let windows = toplevels
             .into_iter()
-            .zip(0..)
-            .map(|((handle, identifier), id)| {
-                let id = WindowId(id);
+            .map(|(handle, identifier)| {
+                // Unique across overlays, so late events for a previous
+                // overlay's captures never reach this one's.
+                let id = WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed));
                 Window {
                     id,
-                    capture: Capture::new(id, &handle, &g, opts.live(), opts.cursors, qh),
+                    capture: Capture::new(id, &handle, &g, req.live, req.cursors, qh),
                     sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
                     handle,
                     identifier,
@@ -232,17 +285,19 @@ impl Overlay {
             windows,
             selected: None,
             highlight_sub,
+            tint_sub,
             viewport,
             layer,
             background,
+            wallpaper,
             highlight,
             placeholder,
             g,
             style: Style {
-                gap: opts.gap as f64,
-                margin: opts.margin as f64,
-                border: opts.border as i32,
-                max_scale: opts.max_scale,
+                gap: config.gap as f64,
+                margin: config.margin as f64,
+                border: config.border as i32,
+                max_scale: config.max_scale,
             },
             width: 0,
             height: 0,
@@ -250,6 +305,7 @@ impl Overlay {
             configured: false,
             mapped: false,
             deadline_passed: false,
+            trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
         })
     }
 
@@ -275,11 +331,29 @@ impl Overlay {
 
     pub fn configure(&mut self, width: u32, height: u32) {
         let changed = !self.configured || (width, height) != (self.width, self.height);
+        if let Some(t0) = self.trace
+            && !self.configured
+        {
+            trace(t0, format_args!("configured {width}x{height}"));
+        }
         self.configured = true;
         self.width = width;
         self.height = height;
         if width > 0 && height > 0 {
             self.viewport.set_destination(width as i32, height as i32);
+            if let Some(wp) = &self.wallpaper {
+                let (x, y, w, h) = background::cover_source(wp.width, wp.height, width, height);
+                self.viewport.set_source(x, y, w, h);
+            }
+            if let Some(tint) = &self.tint_sub {
+                tint.place(IRect {
+                    x: 0,
+                    y: 0,
+                    w: width as i32,
+                    h: height as i32,
+                });
+                tint.surface.commit();
+            }
         }
         if !self.mapped {
             return;
@@ -342,10 +416,26 @@ impl Overlay {
     pub fn capture_update(
         &mut self,
         id: WindowId,
-        f: impl FnOnce(&mut Capture, &Shm) -> Option<CaptureEvent>,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
     ) {
         let Some(i) = self.index_of(id) else { return };
-        match f(&mut self.windows[i].capture, &self.g.shm) {
+        let had_size = self.windows[i].capture.size().is_some();
+        let had_frame = self.windows[i].shown.is_some();
+        let event = f(&mut self.windows[i].capture, &self.g);
+        if let Some(t0) = self.trace {
+            let win = &self.windows[i];
+            if !had_size && let Some((w, h)) = win.capture.size() {
+                trace(t0, format_args!("'{}': size {w}x{h}", win.identifier));
+            }
+            if !had_frame && matches!(event, Some(CaptureEvent::Frame(_))) {
+                let kind = win.capture.buffer_kind().unwrap_or("?");
+                trace(
+                    t0,
+                    format_args!("'{}': first frame ({kind})", win.identifier),
+                );
+            }
+        }
+        match event {
             Some(CaptureEvent::Frame(frame)) => self.show_frame(i, frame),
             Some(CaptureEvent::Failed(why)) => {
                 let win = &self.windows[i];
@@ -361,20 +451,20 @@ impl Overlay {
     }
 
     fn show_frame(&mut self, i: usize, frame: Frame) {
+        let scale = self.scale;
         let win = &mut self.windows[i];
-        let shown = Shown {
+        // The layout used the announced capture size until now; only a
+        // different size (or a rotation) moves anything.
+        let laid_out = win.size(scale);
+        win.shown = Some(Shown {
             width: frame.width,
             height: frame.height,
             transform: frame.transform,
-        };
-        let resized = win.shown.is_none_or(|s| {
-            (s.width, s.height) != (shown.width, shown.height)
-                || transform_swaps(s.transform) != transform_swaps(shown.transform)
         });
-        win.shown = Some(shown);
+        let resized = win.size(scale) != laid_out;
         win.sub.surface.set_buffer_transform(frame.transform);
         win.sub.attach(&frame.buffer);
-        if resized && self.configured {
+        if resized && self.mapped {
             self.relayout(); // commits every thumbnail
         } else {
             win.sub.surface.commit();
@@ -408,17 +498,30 @@ impl Overlay {
         self.maybe_map();
     }
 
-    /// Map once configured and every capture settled, or the deadline passed.
+    /// Map once configured and every capture knows its size (frames fill in
+    /// as they arrive), or the deadline passed.
     pub fn maybe_map(&mut self) {
         if self.mapped || !self.configured {
             return;
         }
-        if !self.deadline_passed && !self.windows.iter().all(|w| w.capture.settled()) {
+        if !self.deadline_passed && !self.windows.iter().all(|w| w.capture.sized()) {
             return;
         }
         self.mapped = true;
+        if let Some(t0) = self.trace {
+            let why = if self.deadline_passed {
+                "deadline"
+            } else {
+                "all sized"
+            };
+            trace(t0, format_args!("mapped ({why})"));
+        }
         let surface = self.layer.wl_surface();
-        surface.attach(Some(&self.background), 0, 0);
+        let buffer = match &self.wallpaper {
+            Some(wp) => &wp.buffer,
+            None => &self.background,
+        };
+        surface.attach(Some(buffer), 0, 0);
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         self.relayout(); // commits the parent, mapping it
     }
@@ -493,6 +596,11 @@ impl Drop for Overlay {
         self.highlight.destroy();
         self.placeholder.destroy();
     }
+}
+
+fn trace(t0: Instant, what: std::fmt::Arguments) {
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("wl-expose: trace {ms:7.1} ms  {what}");
 }
 
 /// A 1x1 buffer of an 0xRRGGBBAA color, for scaling with a viewport.

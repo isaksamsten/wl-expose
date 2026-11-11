@@ -1,38 +1,52 @@
 //! wl-expose: pick a window from an exposé-style overlay and print its ID.
 
 mod app;
+mod background;
 mod capture;
+mod config;
+mod daemon;
+mod dmabuf;
 mod globals;
 mod input;
+mod ipc;
 mod layout;
 mod options;
 mod overlay;
 mod toplevel;
 
+use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::rc::Rc;
 
 use smithay_client_toolkit::reexports::{
-    calloop::{
-        EventLoop,
-        timer::{TimeoutAction, Timer},
-    },
-    calloop_wayland_source::WaylandSource,
+    calloop::EventLoop, calloop_wayland_source::WaylandSource,
 };
-use wayland_client::{Connection, Proxy, globals::registry_queue_init};
+use wayland_client::{Connection, Proxy, QueueHandle, globals::registry_queue_init};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1;
 
 use crate::app::{App, Outcome};
+use crate::background::Image;
+use crate::config::Config;
 use crate::globals::Globals;
 use crate::options::Options;
-use crate::overlay::Overlay;
+use crate::overlay::Wallpaper;
 
 fn main() -> ExitCode {
     let opts = match Options::parse_args() {
         Ok(opts) => opts,
         Err(code) => return code,
     };
-    match run(&opts) {
+    if opts.use_daemon()
+        && let Some(code) = daemon::client(&opts.request())
+    {
+        return code;
+    }
+    let result = if opts.daemon {
+        daemon::run(&opts)
+    } else {
+        run(&opts)
+    };
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("wl-expose: {e}");
@@ -43,7 +57,19 @@ fn main() -> ExitCode {
 
 type Error = Box<dyn std::error::Error>;
 
-fn run(opts: &Options) -> Result<ExitCode, Error> {
+/// A Wayland connection with the window list received.
+pub struct Wayland {
+    pub conn: Connection,
+    pub qh: QueueHandle<App>,
+    pub event_loop: EventLoop<'static, App>,
+    pub app: App,
+    /// What the overlay needs; None if not requested.
+    pub g: Option<Rc<Globals>>,
+}
+
+/// Connect, bind the globals (those of the overlay too if `overlay`), and
+/// receive the window list.
+pub fn connect(overlay: bool) -> Result<Wayland, Error> {
     let conn = Connection::connect_to_env()
         .map_err(|e| format!("failed to connect to wayland display: {e}"))?;
     let (globals, mut queue) = registry_queue_init::<App>(&conn)?;
@@ -54,75 +80,83 @@ fn run(opts: &Options) -> Result<ExitCode, Error> {
         .contents()
         .with_list(|list| list.iter().any(|g| g.interface == toplevel_list))
     {
-        eprintln!("wl-expose: missing global: {toplevel_list}");
-        return Ok(ExitCode::FAILURE);
+        return Err(format!("missing global: {toplevel_list}").into());
     }
-    let globals_overlay = if opts.list {
-        None
+    let g = if overlay {
+        // Globals::bind reports each missing global.
+        let g = Globals::bind(&globals, &qh).ok_or("required globals missing")?;
+        Some(Rc::new(g))
     } else {
-        match Globals::bind(&globals, &qh) {
-            Some(g) => Some(g),
-            None => return Ok(ExitCode::FAILURE),
-        }
+        None
     };
 
-    let mut event_loop: EventLoop<App> = EventLoop::try_new()?;
+    let event_loop: EventLoop<App> = EventLoop::try_new()?;
     let mut app = App::new(&globals, &qh, event_loop.handle());
     // The first roundtrip delivers the handles, the second their state.
     queue.roundtrip(&mut app)?;
     queue.roundtrip(&mut app)?;
+    WaylandSource::new(conn.clone(), queue).insert(event_loop.handle())?;
+    Ok(Wayland {
+        conn,
+        qh,
+        event_loop,
+        app,
+        g,
+    })
+}
 
-    let (handles, toplevels): (Vec<_>, Vec<_>) = app.toplevels().into_iter().unzip();
-    let Some(g) = globals_overlay else {
+/// Decode `path` into an shm buffer.
+pub fn load_wallpaper(
+    path: &Path,
+    g: &Globals,
+    qh: &QueueHandle<App>,
+) -> Result<Rc<Wallpaper>, String> {
+    let img = Image::load(path)?;
+    let wallpaper = Wallpaper::new(g, &img, qh).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Rc::new(wallpaper))
+}
+
+/// Without a daemon: show the overlay from this process.
+fn run(opts: &Options) -> Result<ExitCode, Error> {
+    let config = if opts.list {
+        None
+    } else {
+        Some(Config::load(opts.config.as_deref()).map_err(|e| format!("config: {e}"))?)
+    };
+    let Wayland {
+        conn,
+        qh,
+        mut event_loop,
+        mut app,
+        g,
+    } = connect(!opts.list)?;
+    let (Some(g), Some(config)) = (g, config) else {
+        let toplevels: Vec<_> = app.toplevels().into_iter().map(|(_, t)| t).collect();
         print!("{}", toplevel::format_list(&toplevels));
         return Ok(ExitCode::SUCCESS);
     };
 
-    let shown = toplevel::select(&toplevels, &opts.ids, |id| {
-        eprintln!("wl-expose: no window with ID '{id}'");
+    // A broken image is not worth failing over: fall back to the color.
+    let wallpaper = config.background_image.as_deref().and_then(|path| {
+        load_wallpaper(path, &g, &qh)
+            .inspect_err(|e| eprintln!("wl-expose: {e}"))
+            .ok()
     });
-    if shown.is_empty() {
-        eprintln!("wl-expose: no windows to show");
+    let mut warn = |m: String| eprintln!("wl-expose: {m}");
+    if let Err(e) = app.show(&g, &opts.request(), &config, wallpaper, &qh, &mut warn) {
+        eprintln!("wl-expose: {e}");
         return Ok(ExitCode::FAILURE);
     }
-    let windows: Vec<_> = shown
-        .iter()
-        .map(|&i| (handles[i].clone(), toplevels[i].identifier.clone()))
-        .collect();
-
-    let mut overlay = Overlay::new(g, windows, opts, &qh)?;
-    // The first window passed in starts selected, unless --select says otherwise.
-    let mut selected = 0;
-    if let Some(id) = &opts.select {
-        match overlay.windows.iter().position(|w| w.identifier == *id) {
-            Some(i) => selected = i,
-            None => eprintln!("wl-expose: --select: no shown window with ID '{id}'"),
-        }
-    }
-    overlay.selected = Some(selected);
-    app.overlay = Some(overlay);
-
-    let handle = event_loop.handle();
-    WaylandSource::new(conn.clone(), queue).insert(handle.clone())?;
-    let timeout = Timer::from_duration(Duration::from_millis(opts.timeout.into()));
-    handle.insert_source(timeout, |_, _, app| {
-        if let Some(overlay) = &mut app.overlay {
-            overlay.deadline_passed();
-        }
-        TimeoutAction::Drop
-    })?;
 
     while app.outcome.is_none() {
         event_loop
             .dispatch(None, &mut app)
             .map_err(|e| format!("wayland connection error: {e}"))?;
-        if let Some(overlay) = &mut app.overlay {
-            overlay.maybe_map();
-        }
+        app.after_dispatch();
     }
 
+    app.end_show();
     app.release_input();
-    app.overlay = None;
     app.toplevels.stop();
     // Make sure the overlay is gone before the caller acts on the result.
     conn.roundtrip()?;

@@ -1,11 +1,17 @@
 //! Application state and the SCTK handlers that don't belong to input.
 
+use std::rc::Rc;
+use std::time::Duration;
+
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
     delegate_dispatch2, delegate_registry,
     foreign_toplevel_list::{ForeignToplevelList, ForeignToplevelListHandler},
     output::{OutputHandler, OutputState},
-    reexports::calloop::LoopHandle,
+    reexports::calloop::{
+        LoopHandle, RegistrationToken,
+        timer::{TimeoutAction, Timer},
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{SeatState, pointer::cursor_shape::CursorShapeManager},
@@ -19,10 +25,13 @@ use wayland_client::{
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 
 use crate::capture::{Capture, CaptureEvent};
-use crate::globals::Shm;
+use crate::config::Config;
+use crate::daemon::Incoming;
+use crate::globals::Globals;
 use crate::input::Input;
-use crate::overlay::{Overlay, WindowId};
-use crate::toplevel::Toplevel;
+use crate::ipc::Request;
+use crate::overlay::{Overlay, Wallpaper, WindowId};
+use crate::toplevel::{self, Toplevel};
 
 pub enum Outcome {
     /// The identifier of the picked window.
@@ -38,10 +47,14 @@ pub struct App {
     pub(crate) cursor_shape: Option<CursorShapeManager>,
     pub(crate) loop_handle: LoopHandle<'static, App>,
     pub(crate) input: Input,
-    /// Created once the windows to show are known; None with `--list`.
+    /// The current overlay, while a show is in progress.
     pub overlay: Option<Overlay>,
+    /// The first-frame timer of the current show, until it fires.
+    deadline: Option<RegistrationToken>,
     /// Set once the user picked or cancelled.
     pub outcome: Option<Outcome>,
+    /// Client events for the daemon loop.
+    pub(crate) inbox: Vec<Incoming>,
 }
 
 impl App {
@@ -59,7 +72,9 @@ impl App {
             loop_handle,
             input: Input::default(),
             overlay: None,
+            deadline: None,
             outcome: None,
+            inbox: Vec::new(),
         }
     }
 
@@ -80,6 +95,73 @@ impl App {
             .collect()
     }
 
+    /// Open the overlay for `req` and start its first-frame timer. Warnings
+    /// about the request go to `warn`.
+    pub fn show(
+        &mut self,
+        g: &Rc<Globals>,
+        req: &Request,
+        config: &Config,
+        wallpaper: Option<Rc<Wallpaper>>,
+        qh: &QueueHandle<App>,
+        warn: &mut dyn FnMut(String),
+    ) -> Result<(), String> {
+        let (handles, toplevels): (Vec<_>, Vec<_>) = self.toplevels().into_iter().unzip();
+        let shown = toplevel::select(&toplevels, &req.ids, |id| {
+            warn(format!("no window with ID '{id}'"));
+        });
+        if shown.is_empty() {
+            return Err("no windows to show".into());
+        }
+        let windows: Vec<_> = shown
+            .iter()
+            .map(|&i| (handles[i].clone(), toplevels[i].identifier.clone()))
+            .collect();
+        let mut overlay = Overlay::new(g.clone(), windows, req, config, wallpaper, qh)
+            .map_err(|e| format!("failed to create the overlay: {e}"))?;
+        // The first window passed in starts selected, unless --select says otherwise.
+        let mut selected = 0;
+        if let Some(id) = &req.select {
+            match overlay.windows.iter().position(|w| w.identifier == *id) {
+                Some(i) => selected = i,
+                None => warn(format!("--select: no shown window with ID '{id}'")),
+            }
+        }
+        overlay.selected = Some(selected);
+        self.overlay = Some(overlay);
+        self.outcome = None;
+
+        let timer = Timer::from_duration(Duration::from_millis(req.timeout_ms.into()));
+        let token = self
+            .loop_handle
+            .insert_source(timer, |_, _, app| {
+                app.deadline = None;
+                if let Some(overlay) = &mut app.overlay {
+                    overlay.deadline_passed();
+                }
+                TimeoutAction::Drop
+            })
+            .map_err(|e| format!("failed to start the timer: {e}"))?;
+        self.deadline = Some(token);
+        Ok(())
+    }
+
+    /// After each event loop dispatch: map once ready.
+    pub fn after_dispatch(&mut self) {
+        if let Some(overlay) = &mut self.overlay {
+            overlay.maybe_map();
+        }
+    }
+
+    /// Destroy the overlay. The caller should roundtrip before acting on the
+    /// outcome, so the overlay is gone by then.
+    pub fn end_show(&mut self) {
+        self.overlay = None;
+        if let Some(token) = self.deadline.take() {
+            self.loop_handle.remove(token);
+        }
+        self.input.reset_pointer();
+    }
     /// The first outcome wins.
     pub fn finish(&mut self, outcome: Outcome) {
         self.outcome.get_or_insert(outcome);
@@ -95,7 +177,7 @@ impl App {
     pub fn capture_update(
         &mut self,
         id: WindowId,
-        f: impl FnOnce(&mut Capture, &Shm) -> Option<CaptureEvent>,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
     ) {
         if let Some(overlay) = &mut self.overlay {
             overlay.capture_update(id, f);

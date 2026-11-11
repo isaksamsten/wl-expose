@@ -116,6 +116,13 @@ impl App {
     }
 }
 
+impl Input {
+    /// The overlay surface is gone; a new one gets a fresh enter.
+    pub fn reset_pointer(&mut self) {
+        self.pointer_inside = false;
+    }
+}
+
 impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state

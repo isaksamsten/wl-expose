@@ -1,9 +1,14 @@
-//! Per-window capture: one ext_image_copy_capture session, two shm buffers.
+//! Per-window capture: one ext_image_copy_capture session, two buffers.
 //!
 //! Frames are captured into the back buffer; on `ready` the buffer is handed
 //! to the overlay (attached to the thumbnail subsurface) and the buffers swap.
 //! In live mode the next frame is requested right away; the compositor only
 //! answers once the window has new content.
+//!
+//! Buffers are dmabufs when the session offers a device and a format the
+//! compositor accepts (the copy stays on the GPU), and shm otherwise. A
+//! session whose dmabuf allocation or first dmabuf frame fails switches to
+//! shm.
 
 use smithay_client_toolkit::{dispatch2::Dispatch2, shm::raw::RawPool};
 use wayland_client::{
@@ -21,6 +26,7 @@ use wayland_protocols::ext::{
 };
 
 use crate::app::App;
+use crate::dmabuf::{self, GpuBuffer};
 use crate::globals::{Globals, Ignore, Shm};
 use crate::overlay::WindowId;
 
@@ -63,6 +69,10 @@ struct Constraints {
     width: u32,
     height: u32,
     shm_formats: Vec<wl_shm::Format>,
+    /// dev_t of the device dmabufs must be allocated on.
+    dmabuf_device: Option<u64>,
+    /// (DRM format, modifiers).
+    dmabuf_formats: Vec<(u32, Vec<u64>)>,
     /// A `done` ended the batch; the next constraint event starts a new one.
     complete: bool,
 }
@@ -71,6 +81,8 @@ impl Constraints {
     fn begin_event(&mut self) {
         if self.complete {
             self.shm_formats.clear();
+            self.dmabuf_device = None;
+            self.dmabuf_formats.clear();
             self.complete = false;
         }
     }
@@ -82,6 +94,39 @@ impl Constraints {
             .copied()
             .find(|f| matches!(f, Argb8888 | Xrgb8888 | Abgr8888 | Xbgr8888))
     }
+
+    /// The preferred dmabuf format and its modifiers that the compositor
+    /// also accepts.
+    fn dmabuf_kind(&self, g: &Globals) -> Option<Kind> {
+        let dmabuf = g.dmabuf.as_ref()?;
+        let device = self.dmabuf_device?;
+        dmabuf::FORMATS.iter().find_map(|&fourcc| {
+            let format = fourcc as u32;
+            let offered: Vec<u64> = self
+                .dmabuf_formats
+                .iter()
+                .filter(|(f, _)| *f == format)
+                .flat_map(|(_, mods)| mods.iter().copied())
+                .collect();
+            let modifiers = dmabuf.accepted(format, &offered);
+            (!modifiers.is_empty()).then_some(Kind::Dmabuf {
+                device,
+                format,
+                modifiers,
+            })
+        })
+    }
+}
+
+/// How a capture's buffers are allocated.
+#[derive(Clone, Debug, PartialEq)]
+enum Kind {
+    Shm(wl_shm::Format),
+    Dmabuf {
+        device: u64,
+        format: u32,
+        modifiers: Vec<u64>,
+    },
 }
 
 pub struct Capture {
@@ -97,6 +142,8 @@ pub struct Capture {
     failures: u32,
     /// At least one frame was handed to the overlay.
     have_frame: bool,
+    /// dmabuf didn't work for this window; use shm.
+    no_dmabuf: bool,
 }
 
 impl Capture {
@@ -128,6 +175,7 @@ impl Capture {
             transform: Transform::Normal,
             failures: 0,
             have_frame: false,
+            no_dmabuf: false,
         }
     }
 
@@ -142,6 +190,19 @@ impl Capture {
         self.have_frame || matches!(self.state, State::Done)
     }
 
+    /// The size is known (enough to lay the window out) or capturing gave up.
+    pub fn sized(&self) -> bool {
+        self.size().is_some() || self.settled()
+    }
+
+    /// "dmabuf" or "shm", once buffers are allocated.
+    pub fn buffer_kind(&self) -> Option<&'static str> {
+        self.buffers.as_ref().map(|b| match b.kind {
+            Kind::Shm(_) => "shm",
+            Kind::Dmabuf { .. } => "dmabuf",
+        })
+    }
+
     fn give_up(&mut self, why: &'static str) -> Option<CaptureEvent> {
         if let State::InFlight { frame, .. } = std::mem::replace(&mut self.state, State::Done) {
             frame.destroy();
@@ -149,28 +210,57 @@ impl Capture {
         (!self.have_frame).then_some(CaptureEvent::Failed(why))
     }
 
+    /// Stop using dmabufs for this window.
+    fn drop_dmabuf(&mut self, why: &str) {
+        eprintln!("wl-expose: dmabuf capture failed ({why}), using shm");
+        self.no_dmabuf = true;
+        if self
+            .buffers
+            .as_ref()
+            .is_some_and(|b| matches!(b.kind, Kind::Dmabuf { .. }))
+        {
+            self.buffers = None;
+        }
+    }
+
     /// (Re)allocate buffers for the latest constraints and request a frame.
-    fn apply_constraints(&mut self, shm: &Shm, qh: &QueueHandle<App>) -> Option<CaptureEvent> {
-        let Some(format) = self.constraints.shm_format() else {
-            return self.give_up("no supported shm format");
-        };
+    fn apply_constraints(&mut self, g: &Globals, qh: &QueueHandle<App>) -> Option<CaptureEvent> {
         let Some((width, height)) = self.size() else {
             return self.give_up("zero buffer size");
         };
-        if !self
-            .buffers
-            .as_ref()
-            .is_some_and(|b| b.matches(width, height, format))
-        {
+        let dmabuf = if self.no_dmabuf {
+            None
+        } else {
+            self.constraints.dmabuf_kind(g)
+        };
+        let shm = self.constraints.shm_format().map(Kind::Shm);
+        for kind in [dmabuf, shm].into_iter().flatten() {
+            if self
+                .buffers
+                .as_ref()
+                .is_some_and(|b| b.matches(width, height, &kind))
+            {
+                return self.start(qh);
+            }
             self.buffers = None;
-            match Buffers::new(shm, self.id, width, height, format, qh) {
-                Ok(b) => self.buffers = Some(b),
-                Err(e) => {
-                    eprintln!("wl-expose: shm allocation failed: {e}");
-                    return self.give_up("shm allocation failed");
+            match Buffers::new(g, self.id, width, height, &kind, qh) {
+                Ok(b) => {
+                    self.buffers = Some(b);
+                    return self.start(qh);
                 }
+                Err(e) => match kind {
+                    Kind::Dmabuf { .. } => self.drop_dmabuf(&e.to_string()),
+                    Kind::Shm(_) => {
+                        eprintln!("wl-expose: shm allocation failed: {e}");
+                        return self.give_up("shm allocation failed");
+                    }
+                },
             }
         }
+        self.give_up("no supported buffer format")
+    }
+
+    fn start(&mut self, qh: &QueueHandle<App>) -> Option<CaptureEvent> {
         self.state = State::Idle;
         self.request_frame(qh);
         None
@@ -212,11 +302,11 @@ impl Capture {
     fn next_frame(
         &mut self,
         realloc: bool,
-        shm: &Shm,
+        g: &Globals,
         qh: &QueueHandle<App>,
     ) -> Option<CaptureEvent> {
         if realloc {
-            self.apply_constraints(shm, qh)
+            self.apply_constraints(g, qh)
         } else {
             self.request_frame(qh);
             None
@@ -226,7 +316,7 @@ impl Capture {
     pub fn session_event(
         &mut self,
         event: ext_image_copy_capture_session_v1::Event,
-        shm: &Shm,
+        g: &Globals,
         qh: &QueueHandle<App>,
     ) -> Option<CaptureEvent> {
         use ext_image_copy_capture_session_v1::Event;
@@ -242,8 +332,14 @@ impl Capture {
                     self.constraints.shm_formats.push(format);
                 }
             }
-            Event::DmabufDevice { .. } | Event::DmabufFormat { .. } => {
+            Event::DmabufDevice { device } => {
                 self.constraints.begin_event();
+                self.constraints.dmabuf_device = dmabuf::parse_dev(&device);
+            }
+            Event::DmabufFormat { format, modifiers } => {
+                self.constraints.begin_event();
+                let modifiers = dmabuf::parse_modifiers(&modifiers);
+                self.constraints.dmabuf_formats.push((format, modifiers));
             }
             Event::Done => {
                 self.constraints.complete = true;
@@ -251,7 +347,7 @@ impl Capture {
                     State::Done => {}
                     // The in-flight frame will fail or complete; reallocate after it.
                     State::InFlight { realloc, .. } => *realloc = true,
-                    State::Starting | State::Idle => return self.apply_constraints(shm, qh),
+                    State::Starting | State::Idle => return self.apply_constraints(g, qh),
                 }
             }
             Event::Stopped => {
@@ -269,7 +365,7 @@ impl Capture {
     pub fn frame_event(
         &mut self,
         event: ext_image_copy_capture_frame_v1::Event,
-        shm: &Shm,
+        g: &Globals,
         qh: &QueueHandle<App>,
     ) -> Option<CaptureEvent> {
         use ext_image_copy_capture_frame_v1::Event;
@@ -293,7 +389,7 @@ impl Capture {
                 };
                 if self.live {
                     // Can only fail after the first frame, so nothing to report.
-                    let _ = self.next_frame(realloc, shm, qh);
+                    let _ = self.next_frame(realloc, g, qh);
                 } else {
                     self.state = State::Done;
                 }
@@ -304,6 +400,11 @@ impl Capture {
                 if reason == WEnum::Value(FailureReason::Stopped) {
                     return self.give_up("stopped");
                 }
+                // A dmabuf that never worked: don't count it, retry with shm.
+                if !self.have_frame && self.buffer_kind() == Some("dmabuf") {
+                    self.drop_dmabuf(&format!("{reason:?}"));
+                    return self.apply_constraints(g, qh);
+                }
                 self.failures += 1;
                 if self.failures > MAX_FAILURES {
                     return self.give_up(match reason {
@@ -313,7 +414,7 @@ impl Capture {
                 }
                 // On buffer_constraints the session sends new constraints; if
                 // they arrived already, this reallocates. Otherwise retry.
-                return self.next_frame(realloc, shm, qh);
+                return self.next_frame(realloc, g, qh);
             }
             _ => {}
         }
@@ -340,62 +441,109 @@ impl Drop for Capture {
     }
 }
 
-/// Two equally sized buffers in one shm pool.
+/// What backs the two buffers; only held to keep it alive.
+#[allow(dead_code)]
+enum Storage {
+    Shm(RawPool),
+    Dmabuf([GpuBuffer; 2]),
+}
+
+/// Two equally sized buffers.
 struct Buffers {
-    _pool: RawPool,
     slots: [WlBuffer; 2],
     busy: [bool; 2],
     /// The slot the next frame is captured into.
     back: usize,
     width: u32,
     height: u32,
-    format: wl_shm::Format,
+    kind: Kind,
+    /// Dropped after the wl_buffers are destroyed.
+    _storage: Storage,
 }
 
 impl Buffers {
     fn new(
-        shm: &Shm,
+        g: &Globals,
         window: WindowId,
         width: u32,
         height: u32,
-        format: wl_shm::Format,
+        kind: &Kind,
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
-        let too_large = || std::io::Error::other("buffer too large");
-        let stride = width.checked_mul(4).ok_or_else(too_large)?;
-        let size = stride.checked_mul(height).ok_or_else(too_large)?;
-        let pool_size = size
-            .checked_mul(2)
-            .filter(|&s| s <= i32::MAX as u32)
-            .ok_or_else(too_large)?;
-        let mut pool = RawPool::new(pool_size as usize, shm).map_err(std::io::Error::other)?;
-        let slots = [0, 1].map(|slot| {
-            let offset = (size * slot as u32) as i32;
-            let data = BufferData { window, slot };
-            pool.create_buffer(
-                offset,
-                width as i32,
-                height as i32,
-                stride as i32,
+        let (slots, storage) = match kind {
+            Kind::Shm(format) => shm_buffers(&g.shm, window, width, height, *format, qh)?,
+            Kind::Dmabuf {
+                device,
                 format,
-                data,
-                qh,
-            )
-        });
+                modifiers,
+            } => {
+                let dmabuf = g.dmabuf.as_ref().ok_or_else(|| {
+                    std::io::Error::other("zwp_linux_dmabuf_v1 missing") // checked by dmabuf_kind
+                })?;
+                let gpu = dmabuf
+                    .gpu(*device)
+                    .ok_or_else(|| std::io::Error::other("no GBM device"))?;
+                let alloc = |slot| {
+                    let data = BufferData { window, slot };
+                    dmabuf.allocate(&gpu, width, height, *format, modifiers, data, qh)
+                };
+                let (b0, g0) = alloc(0)?;
+                let (b1, g1) = match alloc(1) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        b0.destroy();
+                        return Err(e);
+                    }
+                };
+                ([b0, b1], Storage::Dmabuf([g0, g1]))
+            }
+        };
         Ok(Self {
-            _pool: pool,
             slots,
             busy: [false; 2],
             back: 0,
             width,
             height,
-            format,
+            kind: kind.clone(),
+            _storage: storage,
         })
     }
 
-    fn matches(&self, width: u32, height: u32, format: wl_shm::Format) -> bool {
-        (self.width, self.height, self.format) == (width, height, format)
+    fn matches(&self, width: u32, height: u32, kind: &Kind) -> bool {
+        (self.width, self.height) == (width, height) && self.kind == *kind
     }
+}
+
+fn shm_buffers(
+    shm: &Shm,
+    window: WindowId,
+    width: u32,
+    height: u32,
+    format: wl_shm::Format,
+    qh: &QueueHandle<App>,
+) -> std::io::Result<([WlBuffer; 2], Storage)> {
+    let too_large = || std::io::Error::other("buffer too large");
+    let stride = width.checked_mul(4).ok_or_else(too_large)?;
+    let size = stride.checked_mul(height).ok_or_else(too_large)?;
+    let pool_size = size
+        .checked_mul(2)
+        .filter(|&s| s <= i32::MAX as u32)
+        .ok_or_else(too_large)?;
+    let mut pool = RawPool::new(pool_size as usize, shm).map_err(std::io::Error::other)?;
+    let slots = [0, 1].map(|slot| {
+        let offset = (size * slot as u32) as i32;
+        let data = BufferData { window, slot };
+        pool.create_buffer(
+            offset,
+            width as i32,
+            height as i32,
+            stride as i32,
+            format,
+            data,
+            qh,
+        )
+    });
+    Ok((slots, Storage::Shm(pool)))
 }
 
 impl Drop for Buffers {
@@ -427,7 +575,7 @@ impl Dispatch2<ExtImageCopyCaptureSessionV1, App> for SessionData {
         _: &Connection,
         qh: &QueueHandle<App>,
     ) {
-        app.capture_update(self.0, |cap, shm| cap.session_event(event, shm, qh));
+        app.capture_update(self.0, |cap, g| cap.session_event(event, g, qh));
     }
 }
 
@@ -440,7 +588,7 @@ impl Dispatch2<ExtImageCopyCaptureFrameV1, App> for FrameData {
         _: &Connection,
         qh: &QueueHandle<App>,
     ) {
-        app.capture_update(self.0, |cap, shm| cap.frame_event(event, shm, qh));
+        app.capture_update(self.0, |cap, g| cap.frame_event(event, g, qh));
     }
 }
 
