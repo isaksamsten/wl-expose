@@ -63,12 +63,6 @@ pub struct Strip {
     pub pixels: Vec<u8>,
 }
 
-impl Strip {
-    pub fn stride(&self) -> i32 {
-        self.width as i32 * 4
-    }
-}
-
 /// The shadow box: the thumbnail grown by `spread` and moved by `offset`, as
 /// edges. None if a negative spread leaves nothing.
 fn shadow_box(w: i32, h: i32, s: &Settings) -> Option<[i32; 4]> {

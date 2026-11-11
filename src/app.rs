@@ -9,7 +9,7 @@ use smithay_client_toolkit::{
     foreign_toplevel_list::{ForeignToplevelList, ForeignToplevelListHandler},
     output::{OutputHandler, OutputState},
     reexports::calloop::{
-        LoopHandle, RegistrationToken,
+        LoopHandle, RegistrationToken, channel,
         timer::{TimeoutAction, Timer},
     },
     registry::{ProvidesRegistryState, RegistryState},
@@ -28,10 +28,12 @@ use crate::capture::{Capture, CaptureEvent};
 use crate::config::Config;
 use crate::daemon::Incoming;
 use crate::globals::Globals;
+use crate::icons;
 use crate::input::Input;
 use crate::ipc::Request;
 use crate::overlay::{Overlay, Wallpaper, WindowId};
 use crate::toplevel::{self, Toplevel};
+use crate::worker::{Assets, Done};
 
 pub enum Outcome {
     /// The identifier of the picked window.
@@ -47,6 +49,8 @@ pub struct App {
     pub(crate) cursor_shape: Option<CursorShapeManager>,
     pub(crate) loop_handle: LoopHandle<'static, App>,
     pub(crate) input: Input,
+    /// The worker thread for icons and titles, started with the first show.
+    assets: Option<Rc<Assets>>,
     /// The current overlay, while a show is in progress.
     pub overlay: Option<Overlay>,
     /// The first-frame timer of the current show, until it fires.
@@ -71,10 +75,86 @@ impl App {
             cursor_shape: CursorShapeManager::bind(globals, qh).ok(),
             loop_handle,
             input: Input::default(),
+            assets: None,
             overlay: None,
             deadline: None,
             outcome: None,
             inbox: Vec::new(),
+        }
+    }
+
+    /// The worker, started on first use; its results go to the overlay.
+    fn assets(&mut self) -> Result<Rc<Assets>, String> {
+        if let Some(assets) = &self.assets {
+            // A daemon's entries may have changed since the last show.
+            assets.refresh();
+            return Ok(assets.clone());
+        }
+        let (assets, results) =
+            Assets::spawn().map_err(|e| format!("failed to start the worker: {e}"))?;
+        self.loop_handle
+            .insert_source(results, |event, _, app| {
+                if let channel::Event::Msg(done) = event {
+                    app.worker_done(done);
+                }
+            })
+            .map_err(|e| format!("failed to watch the worker: {e}"))?;
+        let assets = Rc::new(assets);
+        self.assets = Some(assets.clone());
+        Ok(assets)
+    }
+
+    fn worker_done(&mut self, done: Done) {
+        if let Some(assets) = &self.assets {
+            assets.received(&done);
+        }
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        match done {
+            Done::Icon { key, .. } => overlay.icon_ready(&key),
+            Done::IconsReloaded => overlay.icons_reloaded(),
+            Done::Pill {
+                window,
+                request,
+                pill,
+            } => overlay.pill_ready(window, request, pill),
+        }
+    }
+
+    /// Forget cached icons, e.g. because the config changed.
+    pub fn clear_icons(&self) {
+        if let Some(assets) = &self.assets {
+            assets.clear_icons();
+        }
+    }
+
+    /// Have the worker load the icons of every open window at every output
+    /// scale, so the daemon's next show has them on its first frame.
+    pub fn prefetch_icons(&mut self, config: &Config) {
+        if config.icon_size == 0 {
+            return;
+        }
+        let assets = match self.assets() {
+            Ok(assets) => assets,
+            Err(e) => return eprintln!("wl-expose: {e}"),
+        };
+        let mut scales: Vec<i32> = self
+            .output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o))
+            .map(|info| info.scale_factor.max(1))
+            .collect();
+        scales.sort_unstable();
+        scales.dedup();
+        if scales.is_empty() {
+            scales.push(1);
+        }
+        for (_, toplevel) in self.toplevels() {
+            for &scale in &scales {
+                let key = icons::Key::new(&toplevel.app_id, config, scale);
+                assets.icon(&key, &config.font);
+            }
         }
     }
 
@@ -115,9 +195,10 @@ impl App {
         }
         let windows: Vec<_> = shown
             .iter()
-            .map(|&i| (handles[i].clone(), toplevels[i].identifier.clone()))
+            .map(|&i| (handles[i].clone(), toplevels[i].clone()))
             .collect();
-        let mut overlay = Overlay::new(g.clone(), windows, req, config, wallpaper, qh)
+        let assets = self.assets()?;
+        let mut overlay = Overlay::new(g.clone(), windows, req, config, wallpaper, assets, qh)
             .map_err(|e| format!("failed to create the overlay: {e}"))?;
         // The first window passed in starts selected, unless --select says otherwise.
         let mut selected = 0;
@@ -198,12 +279,25 @@ impl ForeignToplevelListHandler for App {
     ) {
     }
 
+    /// Titles (and app_ids) update live.
     fn update_toplevel(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: ExtForeignToplevelHandleV1,
+        handle: ExtForeignToplevelHandleV1,
     ) {
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        let Some(info) = self.toplevels.info(&handle) else {
+            return;
+        };
+        let toplevel = Toplevel {
+            identifier: info.identifier,
+            app_id: info.app_id,
+            title: info.title,
+        };
+        overlay.update_toplevel(&handle, &toplevel);
     }
 
     fn toplevel_closed(

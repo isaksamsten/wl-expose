@@ -6,10 +6,14 @@
 //! let the compositor scale them. With a background image, the image is the
 //! main surface's buffer (cropped to cover it) and the background color is a
 //! tint subsurface above it. Shadows are up to four shm strips around each
-//! thumbnail, below every thumbnail. All subsurfaces have an empty input
-//! region, so pointer events arrive on the main surface and are hit-tested
-//! here.
+//! thumbnail, below every thumbnail. App icons (shm, one buffer per app)
+//! sit on the thumbnails' bottom edges, above every thumbnail, and the
+//! selected window's title pill is above everything. Icons and pills are
+//! rendered by the worker thread and attached when they arrive. All
+//! subsurfaces have an empty input region, so pointer events arrive on the
+//! main surface and are hit-tested here.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Instant;
@@ -40,12 +44,19 @@ use crate::background::{self, Image};
 use crate::capture::{Capture, CaptureEvent, Frame};
 use crate::config::Config;
 use crate::globals::{Globals, Ignore};
+use crate::icons;
 use crate::ipc::Request;
 use crate::layout::{self, Dir};
 use crate::shadow;
+use crate::text;
+use crate::toplevel::Toplevel;
+use crate::worker::{Assets, PillRequest};
 
 /// Layout size of a window whose capture size is not known yet.
 const DEFAULT_SIZE: (f64, f64) = (800.0, 500.0);
+
+/// Space between the icon and the title pill, logical pixels.
+const PILL_GAP: i32 = 6;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -199,47 +210,64 @@ impl Drop for Shadow {
     }
 }
 
-/// An shm buffer holding a shadow strip. The pool is gone once this returns;
-/// the buffer keeps the memory alive.
+/// An shm buffer holding premultiplied ARGB8888 `pixels`. The pool is gone
+/// once this returns; the buffer keeps the memory alive.
+fn shm_buffer<U>(
+    g: &Globals,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    data: U,
+    qh: &QueueHandle<App>,
+) -> std::io::Result<WlBuffer>
+where
+    App: wayland_client::Dispatch<WlBuffer, U>,
+    U: Send + Sync + 'static,
+{
+    let len = pixels.len();
+    if len > i32::MAX as usize || len != width as usize * height as usize * 4 || len == 0 {
+        return Err(std::io::Error::other("bad buffer size"));
+    }
+    let mut pool = RawPool::new(len, &g.shm).map_err(std::io::Error::other)?;
+    pool.mmap()[..len].copy_from_slice(pixels);
+    Ok(pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        width as i32 * 4,
+        wl_shm::Format::Argb8888,
+        data,
+        qh,
+    ))
+}
+
 fn strip_buffer(
     g: &Globals,
     strip: &shadow::Strip,
     qh: &QueueHandle<App>,
 ) -> std::io::Result<WlBuffer> {
-    let len = strip.pixels.len();
-    if len > i32::MAX as usize {
-        return Err(std::io::Error::other("buffer too large"));
-    }
-    let mut pool = RawPool::new(len, &g.shm).map_err(std::io::Error::other)?;
-    pool.mmap()[..len].copy_from_slice(&strip.pixels);
-    Ok(pool.create_buffer(
-        0,
-        strip.width as i32,
-        strip.height as i32,
-        strip.stride(),
-        wl_shm::Format::Argb8888,
-        StripBuffer::default(),
-        qh,
-    ))
+    let data = OnceBuffer::default();
+    shm_buffer(g, strip.width, strip.height, &strip.pixels, data, qh)
 }
 
-/// User data of a shadow strip buffer: it is destroyed once it is both
-/// replaced (retired) and released by the compositor, whichever comes last.
+/// User data of a buffer that is attached once and replaced later (shadow
+/// strips, title pills): it is destroyed once it is both replaced (retired)
+/// and released by the compositor, whichever comes last.
 #[derive(Default)]
-struct StripBuffer(AtomicU8);
+struct OnceBuffer(AtomicU8);
 
 const RELEASED: u8 = 1;
 const RETIRED: u8 = 2;
 
 fn retire(buffer: &WlBuffer) {
-    if let Some(data) = buffer.data::<StripBuffer>()
+    if let Some(data) = buffer.data::<OnceBuffer>()
         && data.0.fetch_or(RETIRED, Ordering::Relaxed) & RELEASED != 0
     {
         buffer.destroy();
     }
 }
 
-impl Dispatch2<WlBuffer, App> for StripBuffer {
+impl Dispatch2<WlBuffer, App> for OnceBuffer {
     fn event(
         &self,
         _: &mut App,
@@ -259,13 +287,25 @@ pub struct Window {
     pub id: WindowId,
     pub handle: ExtForeignToplevelHandleV1,
     pub identifier: String,
+    app_id: String,
+    title: String,
     capture: Capture,
     sub: Sub,
     /// None with shadows disabled.
     shadow: Option<Shadow>,
+    /// None with icons disabled.
+    icon: Option<Icon>,
     pub rect: IRect,
     /// The capture frame attached to the thumbnail; None: the placeholder.
     shown: Option<Shown>,
+}
+
+/// A window's app icon, centered on the thumbnail's bottom edge.
+struct Icon {
+    sub: Sub,
+    rect: IRect,
+    /// The icon attached, if any.
+    attached: Option<icons::Key>,
 }
 
 impl Window {
@@ -302,6 +342,43 @@ struct Style {
     border: i32,
     max_scale: f64,
     shadow: Option<shadow::Settings>,
+    /// Logical pixels; 0: no icons.
+    icon_size: i32,
+    icon_theme: Option<String>,
+    /// For letter icons.
+    font: String,
+    /// None: no title pill.
+    title: Option<text::Style>,
+}
+
+impl Style {
+    /// How far the icon reaches below the thumbnail: the lower half.
+    fn icon_below(&self) -> i32 {
+        self.icon_size - self.icon_size / 2
+    }
+
+    /// How far below the thumbnail the title pill starts.
+    fn pill_offset(&self) -> i32 {
+        self.icon_below() + PILL_GAP
+    }
+
+    /// Space the layout keeps free below each thumbnail: the lower half of
+    /// the icon, then the title pill.
+    fn below(&self) -> f64 {
+        match &self.title {
+            Some(t) => (self.pill_offset() + text::pill_height(t.size)) as f64,
+            None => self.icon_below() as f64,
+        }
+    }
+}
+
+/// The title pill on screen: what it shows and where.
+struct ShownPill {
+    window: WindowId,
+    request: PillRequest,
+    buffer: WlBuffer,
+    width: i32,
+    height: i32,
 }
 
 /// A background image in an shm buffer, shared by every overlay of a daemon.
@@ -337,6 +414,8 @@ pub struct Overlay {
     // Field order is drop order: children before their parent surface.
     pub windows: Vec<Window>,
     pub selected: Option<usize>,
+    /// The selected window's title; None with titles disabled.
+    pill_sub: Option<Sub>,
     highlight_sub: Sub,
     /// The background color over the wallpaper; None without one.
     tint_sub: Option<Sub>,
@@ -346,6 +425,15 @@ pub struct Overlay {
     wallpaper: Option<Rc<Wallpaper>>,
     highlight: WlBuffer,
     placeholder: WlBuffer,
+    /// Icon buffers, shared by the windows of an app.
+    icon_buffers: HashMap<icons::Key, WlBuffer>,
+    /// Replaced icon buffers, possibly still attached.
+    stale_buffers: Vec<WlBuffer>,
+    /// The pill attached to `pill_sub`.
+    pill: Option<ShownPill>,
+    /// The pill requested from the worker, until it arrives.
+    pill_wanted: Option<(WindowId, PillRequest)>,
+    assets: Rc<Assets>,
     g: Rc<Globals>,
     qh: QueueHandle<App>,
     style: Style,
@@ -362,14 +450,15 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    /// Create the overlay for `toplevels` (handle and identifier each), in
-    /// layout order, and start capturing them.
+    /// Create the overlay for `toplevels`, in layout order, and start
+    /// capturing them. Icons and titles come from `assets`.
     pub fn new(
         g: Rc<Globals>,
-        toplevels: Vec<(ExtForeignToplevelHandleV1, String)>,
+        toplevels: Vec<(ExtForeignToplevelHandleV1, Toplevel)>,
         req: &Request,
         config: &Config,
         wallpaper: Option<Rc<Wallpaper>>,
+        assets: Rc<Assets>,
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
         let background = color_buffer(&g, config.background, qh)?;
@@ -411,10 +500,10 @@ impl Overlay {
             .collect();
         let highlight_sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
 
-        let windows = toplevels
+        let mut windows: Vec<Window> = toplevels
             .into_iter()
             .zip(shadows)
-            .map(|((handle, identifier), shadow)| {
+            .map(|((handle, toplevel), shadow)| {
                 // Unique across overlays, so late events for a previous
                 // overlay's captures never reach this one's.
                 let id = WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed));
@@ -423,13 +512,30 @@ impl Overlay {
                     capture: Capture::new(id, &handle, &g, req.live, req.cursors, qh),
                     sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
                     shadow,
+                    icon: None,
                     handle,
-                    identifier,
+                    identifier: toplevel.identifier,
+                    app_id: toplevel.app_id,
+                    title: toplevel.title,
                     rect: IRect::default(),
                     shown: None,
                 }
             })
             .collect();
+        // Above every thumbnail, then the pill above everything.
+        if config.icon_size > 0 {
+            for win in &mut windows {
+                win.icon = Some(Icon {
+                    sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
+                    rect: IRect::default(),
+                    attached: None,
+                });
+            }
+        }
+        let title = config.title_style();
+        let pill_sub = title
+            .is_some()
+            .then(|| Sub::new(&g, layer.wl_surface(), &no_input, qh));
 
         // Initial commit without a buffer; the map happens once frames are in.
         layer.commit();
@@ -437,6 +543,7 @@ impl Overlay {
         Ok(Self {
             windows,
             selected: None,
+            pill_sub,
             highlight_sub,
             tint_sub,
             viewport,
@@ -445,6 +552,11 @@ impl Overlay {
             wallpaper,
             highlight,
             placeholder,
+            icon_buffers: HashMap::new(),
+            stale_buffers: Vec::new(),
+            pill: None,
+            pill_wanted: None,
+            assets,
             g,
             qh: qh.clone(),
             style: Style {
@@ -453,6 +565,10 @@ impl Overlay {
                 border: config.border as i32,
                 max_scale: config.max_scale,
                 shadow,
+                icon_size: config.icon_size as i32,
+                icon_theme: config.icon_theme.clone(),
+                font: config.font.clone(),
+                title,
             },
             width: 0,
             height: 0,
@@ -545,6 +661,7 @@ impl Overlay {
         let params = layout::Params {
             spacing: self.style.gap,
             max_scale: self.style.max_scale,
+            below: self.style.below(),
         };
         let rects = layout::compute(&items, area, &params);
 
@@ -566,8 +683,112 @@ impl Overlay {
             if let (Some(sh), Some(settings)) = (&mut win.shadow, &self.style.shadow) {
                 sh.update(&self.g, settings, win.rect, self.scale, &self.qh);
             }
+            if let Some(icon) = &mut win.icon {
+                let (r, s) = (win.rect, self.style.icon_size);
+                icon.rect = IRect {
+                    x: r.x + (r.w - s) / 2,
+                    y: r.y + r.h - s / 2,
+                    w: s,
+                    h: s,
+                };
+                icon.sub.place(icon.rect);
+            }
         }
+        self.update_icons(); // commits every icon
         self.update_highlight(); // commits the parent
+    }
+
+    /// The icon key of `app_id` at the current scale.
+    fn icon_key(&self, app_id: &str) -> icons::Key {
+        icons::Key {
+            app_id: app_id.to_string(),
+            size: (self.style.icon_size * self.scale) as u32,
+            theme: self.style.icon_theme.clone(),
+        }
+    }
+
+    /// The icon buffer for `key`, made from the received image. None if the
+    /// image isn't there yet; it is requested then.
+    fn icon_buffer(&mut self, key: &icons::Key) -> Option<WlBuffer> {
+        if let Some(buffer) = self.icon_buffers.get(key) {
+            return Some(buffer.clone());
+        }
+        let img = self.assets.icon(key, &self.style.font)?;
+        match shm_buffer(&self.g, img.width, img.height, &img.data, Ignore, &self.qh) {
+            Ok(buffer) => {
+                self.icon_buffers.insert(key.clone(), buffer.clone());
+                Some(buffer)
+            }
+            Err(e) => {
+                eprintln!("wl-expose: icon buffer: {e}");
+                None
+            }
+        }
+    }
+
+    /// Attach every window's current icon that is available, request the
+    /// others, and commit the icons.
+    fn update_icons(&mut self) {
+        for i in 0..self.windows.len() {
+            let Some(icon) = &self.windows[i].icon else {
+                continue;
+            };
+            let key = self.icon_key(&self.windows[i].app_id);
+            if icon.attached.as_ref() != Some(&key)
+                && let Some(buffer) = self.icon_buffer(&key)
+                && let Some(icon) = &mut self.windows[i].icon
+            {
+                icon.sub.attach(&buffer);
+                icon.attached = Some(key);
+            }
+            if let Some(icon) = &self.windows[i].icon {
+                icon.sub.surface.commit();
+            }
+        }
+    }
+
+    /// An icon arrived from the worker.
+    pub fn icon_ready(&mut self, key: &icons::Key) {
+        let wanted = self
+            .windows
+            .iter()
+            .any(|w| w.icon.is_some() && self.icon_key(&w.app_id) == *key);
+        // Before mapping, the map's relayout attaches it.
+        if wanted && self.mapped {
+            self.update_icons();
+        }
+    }
+
+    /// The desktop entries changed: get every icon again.
+    pub fn icons_reloaded(&mut self) {
+        // Attached buffers may be in use; keep them until the overlay goes.
+        self.stale_buffers
+            .extend(self.icon_buffers.drain().map(|(_, buffer)| buffer));
+        for icon in self.windows.iter_mut().filter_map(|w| w.icon.as_mut()) {
+            icon.attached = None;
+        }
+        if self.mapped {
+            self.update_icons();
+        }
+    }
+
+    /// The title or app_id of a shown window changed.
+    pub fn update_toplevel(&mut self, handle: &ExtForeignToplevelHandleV1, toplevel: &Toplevel) {
+        let Some(i) = self.windows.iter().position(|w| w.handle == *handle) else {
+            return;
+        };
+        let win = &mut self.windows[i];
+        let app_changed = win.app_id != toplevel.app_id;
+        let title_changed = win.title != toplevel.title;
+        win.app_id.clone_from(&toplevel.app_id);
+        win.title.clone_from(&toplevel.title);
+        if app_changed && self.mapped {
+            self.update_icons();
+        }
+        if title_changed && self.selected == Some(i) {
+            self.update_pill();
+            self.commit_parent();
+        }
     }
 
     /// Run `f` on a window's capture and apply what it reports.
@@ -629,7 +850,8 @@ impl Overlay {
         }
     }
 
-    pub fn update_highlight(&self) {
+    /// Move the highlight and the title pill to the selection.
+    pub fn update_highlight(&mut self) {
         let b = self.style.border;
         let sub = &self.highlight_sub;
         match self.selected.map(|i| &self.windows[i]) {
@@ -647,6 +869,109 @@ impl Overlay {
             _ => sub.surface.attach(None, 0, 0),
         }
         sub.surface.commit();
+        self.update_pill();
+        self.commit_parent();
+    }
+
+    /// The selected window, once laid out.
+    fn selected_window(&self) -> Option<&Window> {
+        let win = self.windows.get(self.selected?)?;
+        (win.rect.w > 0 && win.rect.h > 0).then_some(win)
+    }
+
+    /// Show the selected window's title: keep, move or replace the pill, or
+    /// request a new one from the worker. The parent commit is the caller's.
+    fn update_pill(&mut self) {
+        let (Some(sub), Some(style)) = (&self.pill_sub, &self.style.title) else {
+            return;
+        };
+        let wanted = self
+            .selected_window()
+            .filter(|w| !w.title.trim().is_empty())
+            .map(|w| {
+                let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.width as i32);
+                let request = PillRequest {
+                    title: w.title.clone(),
+                    max_width,
+                    scale: self.scale,
+                    style: style.clone(),
+                };
+                (w.id, request)
+            });
+        // A pill of another window goes right away; an outdated one of the
+        // same window stays until its replacement arrives.
+        let keep = matches!((&self.pill, &wanted), (Some(p), Some((id, _))) if p.window == *id);
+        if !keep && let Some(old) = self.pill.take() {
+            retire(&old.buffer);
+            sub.surface.attach(None, 0, 0);
+            sub.surface.commit();
+        }
+        let current = self.pill.as_ref().map(|p| (p.window, &p.request));
+        match wanted {
+            Some((id, request)) if current != Some((id, &request)) => {
+                if self.pill_wanted.as_ref() != Some(&(id, request.clone())) {
+                    self.assets.pill(id, request.clone());
+                    self.pill_wanted = Some((id, request));
+                }
+            }
+            _ => self.pill_wanted = None,
+        }
+        self.place_pill();
+    }
+
+    /// Put the pill below its window's icon, centered and inside the output.
+    fn place_pill(&self) {
+        let (Some(sub), Some(pill)) = (&self.pill_sub, &self.pill) else {
+            return;
+        };
+        let Some(win) = self.windows.iter().find(|w| w.id == pill.window) else {
+            return;
+        };
+        let r = win.rect;
+        let max_x = (self.width as i32 - pill.width).max(0);
+        sub.place(IRect {
+            x: (r.x + (r.w - pill.width) / 2).clamp(0, max_x),
+            y: r.y + r.h + self.style.pill_offset(),
+            w: pill.width,
+            h: pill.height,
+        });
+        sub.surface.commit();
+    }
+
+    /// A pill arrived from the worker.
+    pub fn pill_ready(&mut self, window: WindowId, request: PillRequest, pill: text::Pill) {
+        if self.pill_wanted.as_ref() != Some(&(window, request.clone())) {
+            return; // the selection or title changed meanwhile
+        }
+        self.pill_wanted = None;
+        let Some(sub) = &self.pill_sub else { return };
+        let img = &pill.image;
+        let buffer = match shm_buffer(
+            &self.g,
+            img.width,
+            img.height,
+            &img.data,
+            OnceBuffer::default(),
+            &self.qh,
+        ) {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                eprintln!("wl-expose: title buffer: {e}");
+                return;
+            }
+        };
+        sub.attach(&buffer);
+        if let Some(old) = self.pill.take() {
+            retire(&old.buffer);
+        }
+        self.pill = Some(ShownPill {
+            window,
+            request,
+            buffer,
+            width: pill.width,
+            height: pill.height,
+        });
+        self.place_pill();
         self.commit_parent();
     }
 
@@ -684,11 +1009,15 @@ impl Overlay {
         self.relayout(); // commits the parent, mapping it
     }
 
+    /// The window whose thumbnail or icon is at (`x`, `y`).
     pub fn hit(&self, x: f64, y: f64) -> Option<usize> {
         if !self.mapped {
             return None;
         }
-        self.windows.iter().position(|w| w.rect.contains(x, y))
+        // Icons are on top, so they win where they cover a thumbnail.
+        let on_icon = |w: &Window| w.icon.as_ref().is_some_and(|i| i.rect.contains(x, y));
+        (self.windows.iter().position(on_icon))
+            .or_else(|| self.windows.iter().position(|w| w.rect.contains(x, y)))
     }
 
     pub fn select(&mut self, i: usize) {
@@ -753,6 +1082,13 @@ impl Drop for Overlay {
         self.background.destroy();
         self.highlight.destroy();
         self.placeholder.destroy();
+        // Like capture buffers, attached ones may be destroyed right away.
+        for buffer in self.icon_buffers.values().chain(&self.stale_buffers) {
+            buffer.destroy();
+        }
+        if let Some(pill) = &self.pill {
+            pill.buffer.destroy();
+        }
     }
 }
 

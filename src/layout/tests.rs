@@ -24,19 +24,35 @@ fn check_invariants(
     gap: f64,
     out: &[Rect],
 ) {
+    check_footprints(name, items, area, max_scale, gap, 0.0, out);
+}
+
+/// Like `check_invariants`, for footprints: each thumbnail plus `below`
+/// under it is inside the area and at least `gap` from the others.
+fn check_footprints(
+    name: &str,
+    items: &[Item],
+    area: Rect,
+    max_scale: f64,
+    gap: f64,
+    below: f64,
+    out: &[Rect],
+) {
     assert_eq!(items.len(), out.len(), "{name}: wrong rect count");
+    let foot = |r: &Rect| Rect::new(r.x, r.y, r.w, r.h + below);
     for (i, (it, r)) in items.iter().zip(out).enumerate() {
         assert!(r.w > 0.0 && r.h > 0.0, "{name}: item {i} has empty rect");
+        let f = foot(r);
         assert!(
-            r.x >= area.x - EPS
-                && r.y >= area.y - EPS
-                && r.x + r.w <= area.x + area.w + EPS
-                && r.y + r.h <= area.y + area.h + EPS,
+            f.x >= area.x - EPS
+                && f.y >= area.y - EPS
+                && f.x + f.w <= area.x + area.w + EPS
+                && f.y + f.h <= area.y + area.h + EPS,
             "{name}: item {i} outside area ({:.2},{:.2} {:.2}x{:.2})",
-            r.x,
-            r.y,
-            r.w,
-            r.h
+            f.x,
+            f.y,
+            f.w,
+            f.h
         );
         let want = it.w / it.h;
         assert!(
@@ -54,7 +70,7 @@ fn check_invariants(
         }
         for (j, other) in out.iter().enumerate().skip(i + 1) {
             assert!(
-                !overlaps(*r, *other, gap),
+                !overlaps(f, foot(other), gap),
                 "{name}: items {i} and {j} too close"
             );
         }
@@ -112,6 +128,7 @@ fn random_cases() -> impl Iterator<Item = RandomCase> {
             } else {
                 rng.range(0.2, 2.0)
             },
+            below: 0.0,
         };
         RandomCase {
             name: format!("random#{iter}"),
@@ -146,7 +163,7 @@ fn random() {
             .iter()
             .enumerate()
             .all(|(i, a)| rows[i + 1..].iter().all(|b| !overlaps(*a, *b, p.spacing)));
-        let natural_fits = Seed::natural(items, area.w / area.h).gap_fits(p.spacing, *area);
+        let natural_fits = Seed::natural(items, area.w / area.h).gap_fits(p.spacing, 0.0, *area);
         if full_gap && natural_fits {
             check_invariants(name, items, *area, p.max_scale, p.spacing, &out);
         }
@@ -158,6 +175,110 @@ fn random() {
             );
         }
     }
+}
+
+/// FNV-1a over the bits of every rect, so exact output changes are caught.
+fn fingerprint(rects: &[Rect], hash: &mut u64) {
+    for r in rects {
+        for v in [r.x, r.y, r.w, r.h] {
+            for b in v.to_bits().to_le_bytes() {
+                *hash = (*hash ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
+}
+
+#[test]
+fn snapshot() {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for c in random_cases().take(300) {
+        fingerprint(&compute(&c.items, c.area, &c.params), &mut hash);
+    }
+    assert_eq!(hash, 0x4d54_1867_1736_572f, "layout output changed");
+}
+
+#[test]
+fn below_footprints() {
+    let mut rng = Rng(7);
+    for (iter, mut c) in random_cases().enumerate().take(1000) {
+        let below = rng.range(0.0, 120.0);
+        c.params.below = below;
+        let p = &c.params;
+        let name = format!("{} below {below:.1}", c.name);
+        let out = compute(&c.items, c.area, p);
+        let seed = Seed::natural(&c.items, c.area.w / c.area.h);
+        if seed.gap_fits(p.spacing, below, c.area) {
+            check_footprints(&name, &c.items, c.area, p.max_scale, p.spacing, below, &out);
+        } else if seed.gap_fits(0.0, below, c.area) {
+            // The gap is reduced, the space below is kept.
+            check_footprints(&name, &c.items, c.area, p.max_scale, 0.0, below, &out);
+        } else {
+            check_invariants(&name, &c.items, c.area, p.max_scale, 0.0, &out);
+        }
+        if iter < 50 {
+            assert_eq!(
+                out,
+                compute(&c.items, c.area, p),
+                "{name}: not deterministic"
+            );
+        }
+    }
+}
+
+#[test]
+fn below_zero_is_unchanged() {
+    // Negative is treated as 0, which is exactly the plain layout.
+    for mut c in random_cases().take(200) {
+        let plain = compute(&c.items, c.area, &c.params);
+        c.params.below = -5.0;
+        assert_eq!(plain, compute(&c.items, c.area, &c.params), "{}", c.name);
+    }
+}
+
+#[test]
+fn below_realistic() {
+    // Room for an icon and a title under each thumbnail; gaps stay exact,
+    // and the space below costs thumbnail size rather than overlapping.
+    let items = [
+        item(1920.0, 1080.0),
+        item(1280.0, 800.0),
+        item(800.0, 600.0),
+        item(1600.0, 1000.0),
+    ];
+    let area = Rect::new(48.0, 48.0, 1824.0, 984.0);
+    let mut p = Params {
+        spacing: 24.0,
+        max_scale: 1.0,
+        below: 0.0,
+    };
+    let plain = compute(&items, area, &p);
+    p.below = 60.0;
+    let out = compute(&items, area, &p);
+    check_footprints("below realistic", &items, area, 1.0, 24.0, 60.0, &out);
+    assert!(thumbnail_area(&out) < thumbnail_area(&plain));
+
+    // A single window: the footprint is centered and fills the height.
+    let one = compute(&items[..1], area, &p)[0];
+    check_footprints("below single", &items[..1], area, 1.0, 0.0, 60.0, &[one]);
+    let foot_center = one.y + (one.h + 60.0) / 2.0;
+    assert!((foot_center - area.center_y()).abs() < EPS, "{one:?}");
+    assert!(
+        (one.y + one.h + 60.0 - (area.y + area.h)).abs() < EPS,
+        "not fitted: {one:?}"
+    );
+}
+
+#[test]
+fn below_too_large() {
+    // More space below than the area has: reduced, never outside the area.
+    let area = Rect::new(0.0, 0.0, 800.0, 200.0);
+    let p = Params {
+        spacing: 24.0,
+        max_scale: 1.0,
+        below: 500.0,
+    };
+    let out = compute(&UTILITIES, area, &p);
+    check_invariants("below too large", &UTILITIES, area, 1.0, 0.0, &out);
 }
 
 // Stale since the natural-placement layout (it reserves breathing room and
@@ -194,6 +315,7 @@ fn realistic() {
     let p = Params {
         spacing: 24.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     for n in 1..=items.len() {
         let out = compute(&items[..n], area, &p);
@@ -215,6 +337,7 @@ fn single_small() {
     let p = Params {
         spacing: 20.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     let out = compute(&[item(400.0, 300.0)], area, &p)[0];
     assert!(
@@ -234,6 +357,7 @@ fn single_large() {
     let p = Params {
         spacing: 20.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     let out = compute(&[item(3840.0, 2160.0)], area, &p)[0];
     assert!((out.w - 1920.0).abs() < EPS, "width {}", out.w);
@@ -323,6 +447,7 @@ fn freeform() {
     let p = Params {
         spacing: 24.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     let rows = rows(&items, area, p.spacing, p.max_scale);
     let out = compute(&items, area, &p);
@@ -365,6 +490,7 @@ fn freeform_limits() {
     let mut p = Params {
         spacing: 24.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     let out = compute(&UTILITIES, area, &p);
     check_invariants("freeform capped", &UTILITIES, area, 1.0, 24.0, &out);
@@ -399,6 +525,7 @@ fn freeform_utilities_grow_to_cap() {
     let p = Params {
         spacing: 24.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     let out = compute(&UTILITIES, area, &p);
     for (i, (r, it)) in out.iter().zip(&UTILITIES).enumerate() {
@@ -439,6 +566,7 @@ fn degenerate() {
     let p = Params {
         spacing: 50.0,
         max_scale: 1.0,
+        below: 0.0,
     };
     assert_eq!(compute(&items, area, &p).len(), 2);
     assert!(compute(&[], area, &p).is_empty());

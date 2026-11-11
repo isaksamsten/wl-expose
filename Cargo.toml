@@ -7,9 +7,13 @@ description = "Window overview (exposé) for Wayland compositors"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+cosmic-text = "0.17"
 drm-fourcc = "2"
+freedesktop-desktop-entry = { version = "0.8", default-features = false }
+freedesktop-icons = "0.4"
 gbm = { version = "0.18", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+resvg = { version = "0.50", default-features = false }
 serde = { version = "1", features = ["derive"] }
 smithay-client-toolkit = "0.21"
 toml = "1"

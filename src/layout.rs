@@ -48,6 +48,10 @@ pub struct Params {
     pub spacing: f64,
     /// Thumbnails are never scaled above this (<= 0: no cap).
     pub max_scale: f64,
+    /// Free space every thumbnail needs below it (icons, titles), in final
+    /// logical pixels, not scaled (negative: 0). The layout works on
+    /// footprints, the thumbnail plus this space; it returns thumbnails.
+    pub below: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,9 +401,10 @@ impl Seed {
         }
     }
 
-    /// Scale the seed, then push rects apart to keep `gap` between every
-    /// constrained pair. Writes into `out` and returns its bounds.
-    fn place(&self, scale: f64, gap: f64, out: &mut [Rect]) -> Rect {
+    /// Scale the seed, then push footprints (rects plus `below`) apart to
+    /// keep `gap` between every constrained pair. Writes the footprints into
+    /// `out` and returns their bounds.
+    fn place(&self, scale: f64, gap: f64, below: f64, out: &mut [Rect]) -> Rect {
         let seed = &self.rects;
         let b = bounds(seed);
         for (o, s) in out.iter_mut().zip(seed) {
@@ -407,7 +412,7 @@ impl Seed {
                 (s.x - b.x) * scale,
                 (s.y - b.y) * scale,
                 s.w * scale,
-                s.h * scale,
+                s.h * scale + below,
             );
         }
         for i in 0..seed.len() {
@@ -425,11 +430,29 @@ impl Seed {
         bounds(out)
     }
 
-    /// Whether zero-sized thumbnails fit `area` with `gap` between them.
-    fn gap_fits(&self, gap: f64, area: Rect) -> bool {
-        let min = self.place(0.0, gap, &mut vec![Rect::default(); self.rects.len()]);
+    /// Whether zero-sized thumbnails fit `area` with `gap` between their
+    /// footprints.
+    fn gap_fits(&self, gap: f64, below: f64, area: Rect) -> bool {
+        let min = self.place(
+            0.0,
+            gap,
+            below,
+            &mut vec![Rect::default(); self.rects.len()],
+        );
         min.w < area.w && min.h < area.h
     }
+}
+
+/// How much `r` can be scaled to fit `area` (infinite along empty axes).
+fn fit_ratio(r: Rect, area: Rect) -> f64 {
+    let ratio = |avail: f64, len: f64| {
+        if len > 0.0 {
+            avail / len
+        } else {
+            f64::INFINITY
+        }
+    };
+    ratio(area.w, r.w).min(ratio(area.h, r.h))
 }
 
 /// Gently dilate centers uniformly, preserving the natural composition and
@@ -467,8 +490,10 @@ fn spread(rects: &mut [Rect], area: Rect) {
 /// constraints. Preserves native size ratios and synthetic seed ordering, with
 /// a shared scale and gentle uniform center spreading instead of edge-to-edge
 /// stretching. If the minimum gap cannot fit the ordering, reduces it with a
-/// stderr warning. At the iteration limit, logs to stderr and sweeps away
-/// remaining collisions. `out[i]` corresponds to `items[i]`.
+/// stderr warning (and `below` too, if even that alone doesn't fit). At the
+/// iteration limit, logs to stderr and sweeps away remaining collisions.
+/// `out[i]` corresponds to `items[i]`; footprints (`out[i]` plus
+/// `params.below` under it) are what is kept inside `area` and apart.
 pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
     let n = items.len();
     if n == 0 {
@@ -482,29 +507,43 @@ pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
     let mut trial = vec![Rect::default(); n];
 
     let mut gap = params.spacing.max(0.0);
-    if !seed.gap_fits(gap, area) {
-        let minimum = seed.place(0.0, gap, &mut trial);
+    let mut below = params.below.max(0.0);
+    if !seed.gap_fits(gap, below, area) {
         // Even zero-sized thumbnails cannot fit this gap with the natural ordering.
         // Keep the result usable, but never silently weaken the requested minimum.
-        let fit = (if minimum.w > 0.0 {
-            area.w / minimum.w
-        } else {
-            f64::INFINITY
-        })
-        .min(if minimum.h > 0.0 {
-            area.h / minimum.h
-        } else {
-            f64::INFINITY
-        });
         let requested = gap;
-        gap *= fit * 0.95;
+        if below == 0.0 {
+            // Footprints are points, so the minimum bounds are linear in the gap.
+            gap *= fit_ratio(seed.place(0.0, gap, 0.0, &mut trial), area) * 0.95;
+        } else if seed.gap_fits(0.0, below, area) {
+            // The largest gap that fits; bounds grow monotonically with it.
+            let (mut lo, mut hi) = (0.0, gap);
+            for _ in 0..48 {
+                let mid = (lo + hi) / 2.0;
+                if seed.gap_fits(mid, below, area) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            gap = lo * 0.95;
+        } else {
+            // Without a gap, the minimum bounds are linear in `below`.
+            gap = 0.0;
+            let requested = below;
+            below *= fit_ratio(seed.place(0.0, 0.0, below, &mut trial), area) * 0.95;
+            eprintln!(
+                "wl-expose: space below thumbnails {requested:.2} cannot fit the natural \
+                 ordering; reducing to {below:.2}"
+            );
+        }
         eprintln!(
             "wl-expose: minimum gap {requested:.2} cannot fit the natural ordering; \
              reducing to {gap:.2}"
         );
     }
 
-    let minimum = seed.place(0.0, gap, &mut trial);
+    let minimum = seed.place(0.0, gap, below, &mut trial);
     // Reserve a little of the size budget for breathing room. Fixed gap costs
     // are excluded, so this remains feasible even in crowded layouts.
     let fill = if n == 1 { 1.0 } else { 0.9 };
@@ -521,7 +560,7 @@ pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
     // budget while keeping the minimum gap in final logical pixels.
     for _ in 0..48 {
         let scale = (lo + hi) / 2.0;
-        let b = seed.place(scale, gap, &mut trial);
+        let b = seed.place(scale, gap, below, &mut trial);
         if b.w <= fit_w && b.h <= fit_h {
             lo = scale;
         } else {
@@ -529,8 +568,12 @@ pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
         }
     }
     let mut out = trial;
-    seed.place(lo, gap, &mut out);
+    seed.place(lo, gap, below, &mut out);
     spread(&mut out, area);
+    // Footprints to thumbnails; exactly the scaled height, not a difference.
+    for (r, s) in out.iter_mut().zip(&seed.rects) {
+        r.h = s.h * lo;
+    }
     out
 }
 

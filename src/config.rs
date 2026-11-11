@@ -47,6 +47,22 @@ pub struct Config {
     /// How far the shadow is moved, `[x, y]`.
     #[serde(deserialize_with = "offset")]
     pub shadow_offset: [i32; 2],
+    /// App icon size; 0 disables icons.
+    #[serde(deserialize_with = "icon_size")]
+    pub icon_size: u32,
+    /// Icon theme (a directory name); default: gsettings, then hicolor.
+    pub icon_theme: Option<String>,
+    /// Show the selected window's title in a pill below it.
+    pub titles: bool,
+    /// Font family for titles (and letter icons).
+    pub font: String,
+    /// Title font size.
+    #[serde(deserialize_with = "font_size")]
+    pub font_size: u32,
+    #[serde(deserialize_with = "color")]
+    pub title_color: u32,
+    #[serde(deserialize_with = "color")]
+    pub title_background: u32,
 }
 
 impl Default for Config {
@@ -64,6 +80,13 @@ impl Default for Config {
             shadow_softness: 30,
             shadow_spread: 5,
             shadow_offset: [0, 5],
+            icon_size: 48,
+            icon_theme: None,
+            titles: true,
+            font: "sans-serif".into(),
+            font_size: 14,
+            title_color: 0xffffffff,
+            title_background: 0x000000b3,
         }
     }
 }
@@ -76,6 +99,16 @@ impl Config {
             softness: self.shadow_softness as f64,
             spread: self.shadow_spread,
             offset: (self.shadow_offset[0], self.shadow_offset[1]),
+        })
+    }
+
+    /// The title pill style; None if titles are disabled.
+    pub fn title_style(&self) -> Option<crate::text::Style> {
+        self.titles.then(|| crate::text::Style {
+            font: self.font.clone(),
+            size: self.font_size as f64,
+            color: self.title_color,
+            background: self.title_background,
         })
     }
 
@@ -173,6 +206,22 @@ fn offset<'de, D: Deserializer<'de>>(d: D) -> Result<[i32; 2], D::Error> {
     Ok([check_signed_px(x)?, check_signed_px(y)?])
 }
 
+fn bounded<'de, D: Deserializer<'de>>(d: D, min: u32, max: u32) -> Result<u32, D::Error> {
+    let v = i64::deserialize(d)?;
+    u32::try_from(v)
+        .ok()
+        .filter(|v| (min..=max).contains(v))
+        .ok_or_else(|| D::Error::custom(format!("expected {min}-{max}, got {v}")))
+}
+
+fn font_size<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    bounded(d, 1, 1000)
+}
+
+fn icon_size<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    bounded(d, 0, 1024)
+}
+
 fn scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     let v = f64::deserialize(d)?;
     if v > 0.0 && v.is_finite() {
@@ -218,6 +267,13 @@ mod tests {
             shadow-softness = 0
             shadow-spread = -3
             shadow-offset = [2, -4]
+            icon-size = 0
+            icon-theme = "Papirus"
+            titles = false
+            font = "Inter"
+            font-size = 12
+            title-color = "eeeeee"
+            title-background = "00000080"
             "##,
         )
         .unwrap();
@@ -231,6 +287,14 @@ mod tests {
         assert_eq!(c.shadow_softness, 0);
         assert_eq!(c.shadow_spread, -3);
         assert_eq!(c.shadow_offset, [2, -4]);
+        assert_eq!(c.icon_size, 0);
+        assert_eq!(c.icon_theme.as_deref(), Some("Papirus"));
+        assert!(!c.titles && c.title_style().is_none());
+        assert_eq!((c.font.as_str(), c.font_size), ("Inter", 12));
+        assert_eq!(
+            (c.title_color, c.title_background),
+            (0xeeeeeeff, 0x00000080)
+        );
     }
 
     #[test]
@@ -243,6 +307,9 @@ mod tests {
         assert!(Config::parse("shadow-spread = 100001").is_err());
         assert!(Config::parse("shadow-offset = [1]").is_err());
         assert!(Config::parse("shadow-softness = -1").is_err());
+        assert!(Config::parse("font-size = 0").is_err());
+        assert!(Config::parse("icon-size = 2000").is_err());
+        assert!(Config::parse("titles = 1").is_err());
         assert!(
             Config::parse("shadow-color = \"00000000\"")
                 .unwrap()

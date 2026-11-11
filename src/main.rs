@@ -7,13 +7,16 @@ mod config;
 mod daemon;
 mod dmabuf;
 mod globals;
+mod icons;
 mod input;
 mod ipc;
 mod layout;
 mod options;
 mod overlay;
 mod shadow;
+mod text;
 mod toplevel;
+mod worker;
 
 use std::path::Path;
 use std::process::ExitCode;

@@ -86,6 +86,8 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
     } = crate::connect(true)?;
     let g = g.expect("overlay globals were requested");
     appearance.refresh(&g, &qh, &mut |m| eprintln!("wl-expose: {m}"));
+    // Start the worker now, so fonts and icons are ready for the first show.
+    app.prefetch_icons(&appearance.config);
 
     let listener = bind(&path)?;
     let _socket = SocketFile(path.clone());
@@ -136,7 +138,10 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
                     req,
                 } => {
                     let mut warn = |m: String| send(&stream, &Reply::Warn(m));
-                    appearance.refresh(&g, &qh, &mut warn);
+                    if appearance.refresh(&g, &qh, &mut warn) {
+                        // Icon size, theme or font may differ.
+                        app.clear_icons();
+                    }
                     let wallpaper = appearance.wallpaper.clone();
                     match app.show(&g, &req, &appearance.config, wallpaper, &qh, &mut warn) {
                         Ok(()) => active = Some((client, stream)),
@@ -164,6 +169,8 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
                     },
                 );
             }
+            // Windows opened since are ready next time.
+            app.prefetch_icons(&appearance.config);
         }
     }
 }
@@ -299,14 +306,21 @@ impl Appearance {
     }
 
     /// Reload whatever changed. Errors keep the previous config, or show no
-    /// image, and are reported to `warn`.
-    fn refresh(&mut self, g: &Globals, qh: &QueueHandle<App>, warn: &mut dyn FnMut(String)) {
+    /// image, and are reported to `warn`. Returns whether the config changed.
+    fn refresh(
+        &mut self,
+        g: &Globals,
+        qh: &QueueHandle<App>,
+        warn: &mut dyn FnMut(String),
+    ) -> bool {
         let config_mtime = Config::path(self.explicit.as_deref())
             .as_deref()
             .and_then(mtime);
+        let mut changed = false;
         if config_mtime != self.config_mtime {
             match Config::load(self.explicit.as_deref()) {
                 Ok(config) => {
+                    changed = config != self.config;
                     self.config = config;
                     self.config_mtime = config_mtime;
                 }
@@ -329,5 +343,6 @@ impl Appearance {
                 }
             }
         }
+        changed
     }
 }
