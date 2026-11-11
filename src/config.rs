@@ -35,6 +35,18 @@ pub struct Config {
     /// Max thumbnail scale.
     #[serde(deserialize_with = "scale")]
     pub max_scale: f64,
+    /// Shadow color; alpha 0 disables shadows.
+    #[serde(deserialize_with = "color")]
+    pub shadow_color: u32,
+    /// Shadow blur radius.
+    #[serde(deserialize_with = "px")]
+    pub shadow_softness: u32,
+    /// How much the shadow box is grown (or shrunk, if negative).
+    #[serde(deserialize_with = "signed_px")]
+    pub shadow_spread: i32,
+    /// How far the shadow is moved, `[x, y]`.
+    #[serde(deserialize_with = "offset")]
+    pub shadow_offset: [i32; 2],
 }
 
 impl Default for Config {
@@ -48,11 +60,25 @@ impl Default for Config {
             margin: 48,
             border: 4,
             max_scale: 1.0,
+            shadow_color: 0x00000077,
+            shadow_softness: 30,
+            shadow_spread: 5,
+            shadow_offset: [0, 5],
         }
     }
 }
 
 impl Config {
+    /// The shadow settings; None if shadows are disabled.
+    pub fn shadow(&self) -> Option<crate::shadow::Settings> {
+        (self.shadow_color & 0xff != 0).then(|| crate::shadow::Settings {
+            color: self.shadow_color,
+            softness: self.shadow_softness as f64,
+            spread: self.shadow_spread,
+            offset: (self.shadow_offset[0], self.shadow_offset[1]),
+        })
+    }
+
     /// The file `load` reads: `explicit`, or the default config file.
     pub fn path(explicit: Option<&Path>) -> Option<PathBuf> {
         explicit.map(Path::to_path_buf).or_else(default_path)
@@ -131,6 +157,22 @@ fn px<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
         .ok_or_else(|| D::Error::custom(format!("expected 0-100000, got {v}")))
 }
 
+fn check_signed_px<E: serde::de::Error>(v: i64) -> Result<i32, E> {
+    i32::try_from(v)
+        .ok()
+        .filter(|v| v.abs() <= 100_000)
+        .ok_or_else(|| E::custom(format!("expected -100000-100000, got {v}")))
+}
+
+fn signed_px<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    check_signed_px(i64::deserialize(d)?)
+}
+
+fn offset<'de, D: Deserializer<'de>>(d: D) -> Result<[i32; 2], D::Error> {
+    let [x, y] = <[i64; 2]>::deserialize(d)?;
+    Ok([check_signed_px(x)?, check_signed_px(y)?])
+}
+
 fn scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     let v = f64::deserialize(d)?;
     if v > 0.0 && v.is_finite() {
@@ -172,6 +214,10 @@ mod tests {
             margin = 0
             border = 2
             max-scale = 2
+            shadow-color = "ff000080"
+            shadow-softness = 0
+            shadow-spread = -3
+            shadow-offset = [2, -4]
             "##,
         )
         .unwrap();
@@ -181,6 +227,10 @@ mod tests {
         assert_eq!(c.placeholder, 0x222222ff);
         assert_eq!((c.gap, c.margin, c.border), (10, 0, 2));
         assert_eq!(c.max_scale, 2.0);
+        assert_eq!(c.shadow_color, 0xff000080);
+        assert_eq!(c.shadow_softness, 0);
+        assert_eq!(c.shadow_spread, -3);
+        assert_eq!(c.shadow_offset, [2, -4]);
     }
 
     #[test]
@@ -190,6 +240,15 @@ mod tests {
         assert!(Config::parse("max-scale = 0").is_err());
         assert!(Config::parse("highlight = \"red\"").is_err());
         assert!(Config::parse("unknown = 1").is_err());
+        assert!(Config::parse("shadow-spread = 100001").is_err());
+        assert!(Config::parse("shadow-offset = [1]").is_err());
+        assert!(Config::parse("shadow-softness = -1").is_err());
+        assert!(
+            Config::parse("shadow-color = \"00000000\"")
+                .unwrap()
+                .shadow()
+                .is_none()
+        );
     }
 
     #[test]

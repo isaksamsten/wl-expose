@@ -5,15 +5,18 @@
 //! scaled with viewports; thumbnails attach the capture buffers directly and
 //! let the compositor scale them. With a background image, the image is the
 //! main surface's buffer (cropped to cover it) and the background color is a
-//! tint subsurface above it. All subsurfaces have an empty input region, so
-//! pointer events arrive on the main surface and are hit-tested here.
+//! tint subsurface above it. Shadows are up to four shm strips around each
+//! thumbnail, below every thumbnail. All subsurfaces have an empty input
+//! region, so pointer events arrive on the main surface and are hit-tested
+//! here.
 
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Instant;
 
 use smithay_client_toolkit::{
     compositor::Region,
+    dispatch2::Dispatch2,
     shell::{
         WaylandSurface,
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
@@ -21,7 +24,7 @@ use smithay_client_toolkit::{
     shm::raw::RawPool,
 };
 use wayland_client::{
-    QueueHandle,
+    Connection, Proxy, QueueHandle,
     protocol::{
         wl_buffer::WlBuffer, wl_output::Transform, wl_shm, wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
@@ -39,6 +42,7 @@ use crate::config::Config;
 use crate::globals::{Globals, Ignore};
 use crate::ipc::Request;
 use crate::layout::{self, Dir};
+use crate::shadow;
 
 /// Layout size of a window whose capture size is not known yet.
 const DEFAULT_SIZE: (f64, f64) = (800.0, 500.0);
@@ -117,12 +121,148 @@ fn transform_swaps(t: Transform) -> bool {
     u32::from(t) & 1 != 0 // 90 and 270, flipped or not
 }
 
+/// A window's shadow: top, bottom, left and right strips.
+struct Shadow {
+    strips: [Sub; 4],
+    /// The attached buffers.
+    buffers: [Option<WlBuffer>; 4],
+    /// Strip rects relative to the thumbnail.
+    rects: [Option<shadow::Rect>; 4],
+    /// Thumbnail size and scale the buffers were rendered for.
+    rendered: Option<(i32, i32, i32)>,
+}
+
+impl Shadow {
+    fn new(g: &Globals, parent: &WlSurface, no_input: &Region, qh: &QueueHandle<App>) -> Self {
+        Self {
+            strips: std::array::from_fn(|_| Sub::new(g, parent, no_input, qh)),
+            buffers: Default::default(),
+            rects: [None; 4],
+            rendered: None,
+        }
+    }
+
+    /// Follow the thumbnail at `r`; re-render only if its size or the scale
+    /// changed.
+    fn update(
+        &mut self,
+        g: &Globals,
+        settings: &shadow::Settings,
+        r: IRect,
+        scale: i32,
+        qh: &QueueHandle<App>,
+    ) {
+        let key = (r.w, r.h, scale);
+        if self.rendered != Some(key) {
+            self.rendered = Some(key);
+            let strips = shadow::render(r.w, r.h, settings, scale);
+            for (k, strip) in strips.into_iter().enumerate() {
+                if let Some(old) = self.buffers[k].take() {
+                    retire(&old);
+                }
+                let buffer = strip.as_ref().and_then(|s| match strip_buffer(g, s, qh) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        eprintln!("wl-expose: shadow buffer: {e}");
+                        None
+                    }
+                });
+                let sub = &self.strips[k];
+                match &buffer {
+                    Some(b) => sub.attach(b),
+                    None => sub.surface.attach(None, 0, 0),
+                }
+                self.rects[k] = buffer.is_some().then(|| strip.unwrap().rect);
+                self.buffers[k] = buffer;
+            }
+        }
+        for (sub, rect) in self.strips.iter().zip(self.rects) {
+            if let Some(s) = rect {
+                sub.place(IRect {
+                    x: r.x + s.x,
+                    y: r.y + s.y,
+                    w: s.w,
+                    h: s.h,
+                });
+            }
+            sub.surface.commit();
+        }
+    }
+}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // Like capture buffers, attached ones may be destroyed right away.
+        for buffer in self.buffers.iter().flatten() {
+            buffer.destroy();
+        }
+    }
+}
+
+/// An shm buffer holding a shadow strip. The pool is gone once this returns;
+/// the buffer keeps the memory alive.
+fn strip_buffer(
+    g: &Globals,
+    strip: &shadow::Strip,
+    qh: &QueueHandle<App>,
+) -> std::io::Result<WlBuffer> {
+    let len = strip.pixels.len();
+    if len > i32::MAX as usize {
+        return Err(std::io::Error::other("buffer too large"));
+    }
+    let mut pool = RawPool::new(len, &g.shm).map_err(std::io::Error::other)?;
+    pool.mmap()[..len].copy_from_slice(&strip.pixels);
+    Ok(pool.create_buffer(
+        0,
+        strip.width as i32,
+        strip.height as i32,
+        strip.stride(),
+        wl_shm::Format::Argb8888,
+        StripBuffer::default(),
+        qh,
+    ))
+}
+
+/// User data of a shadow strip buffer: it is destroyed once it is both
+/// replaced (retired) and released by the compositor, whichever comes last.
+#[derive(Default)]
+struct StripBuffer(AtomicU8);
+
+const RELEASED: u8 = 1;
+const RETIRED: u8 = 2;
+
+fn retire(buffer: &WlBuffer) {
+    if let Some(data) = buffer.data::<StripBuffer>()
+        && data.0.fetch_or(RETIRED, Ordering::Relaxed) & RELEASED != 0
+    {
+        buffer.destroy();
+    }
+}
+
+impl Dispatch2<WlBuffer, App> for StripBuffer {
+    fn event(
+        &self,
+        _: &mut App,
+        buffer: &WlBuffer,
+        _: wayland_client::protocol::wl_buffer::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        // The only event is release. Each buffer is attached exactly once.
+        if self.0.fetch_or(RELEASED, Ordering::Relaxed) & RETIRED != 0 {
+            buffer.destroy();
+        }
+    }
+}
+
 pub struct Window {
     pub id: WindowId,
     pub handle: ExtForeignToplevelHandleV1,
     pub identifier: String,
     capture: Capture,
     sub: Sub,
+    /// None with shadows disabled.
+    shadow: Option<Shadow>,
     pub rect: IRect,
     /// The capture frame attached to the thumbnail; None: the placeholder.
     shown: Option<Shown>,
@@ -161,6 +301,7 @@ struct Style {
     margin: f64,
     border: i32,
     max_scale: f64,
+    shadow: Option<shadow::Settings>,
 }
 
 /// A background image in an shm buffer, shared by every overlay of a daemon.
@@ -206,6 +347,7 @@ pub struct Overlay {
     highlight: WlBuffer,
     placeholder: WlBuffer,
     g: Rc<Globals>,
+    qh: QueueHandle<App>,
     style: Style,
 
     width: u32,
@@ -251,18 +393,28 @@ impl Overlay {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
-        // Created before the thumbnails, so they start below all of them,
-        // the tint lowest.
+        // Created before the thumbnails, so they start below all of them:
+        // the tint lowest, then every shadow, then the highlight.
         let tint_sub = (wallpaper.is_some() && config.background & 0xff != 0).then(|| {
             let sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
             sub.attach(&background);
             sub
         });
+        let shadow = config.shadow();
+        let shadows: Vec<Option<Shadow>> = toplevels
+            .iter()
+            .map(|_| {
+                shadow
+                    .is_some()
+                    .then(|| Shadow::new(&g, layer.wl_surface(), &no_input, qh))
+            })
+            .collect();
         let highlight_sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
 
         let windows = toplevels
             .into_iter()
-            .map(|(handle, identifier)| {
+            .zip(shadows)
+            .map(|((handle, identifier), shadow)| {
                 // Unique across overlays, so late events for a previous
                 // overlay's captures never reach this one's.
                 let id = WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed));
@@ -270,6 +422,7 @@ impl Overlay {
                     id,
                     capture: Capture::new(id, &handle, &g, req.live, req.cursors, qh),
                     sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
+                    shadow,
                     handle,
                     identifier,
                     rect: IRect::default(),
@@ -293,11 +446,13 @@ impl Overlay {
             highlight,
             placeholder,
             g,
+            qh: qh.clone(),
             style: Style {
                 gap: config.gap as f64,
                 margin: config.margin as f64,
                 border: config.border as i32,
                 max_scale: config.max_scale,
+                shadow,
             },
             width: 0,
             height: 0,
@@ -408,6 +563,9 @@ impl Overlay {
                 win.sub.attach(&self.placeholder);
             }
             win.sub.surface.commit();
+            if let (Some(sh), Some(settings)) = (&mut win.shadow, &self.style.shadow) {
+                sh.update(&self.g, settings, win.rect, self.scale, &self.qh);
+            }
         }
         self.update_highlight(); // commits the parent
     }

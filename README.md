@@ -100,6 +100,10 @@ gap = 24                    # minimum space between thumbnails, px
 margin = 48                 # space around the layout, px
 border = 4                  # selection border width, px
 max-scale = 1.0             # max thumbnail scale
+shadow-color = "00000077"   # alpha 0 disables shadows
+shadow-softness = 30        # shadow blur radius, px
+shadow-spread = 5           # px, may be negative
+shadow-offset = [0, 5]      # px
 ```
 
 `background-image` is scaled to cover the output (centered, cropped to keep its
@@ -107,6 +111,9 @@ aspect ratio) by the compositor. `~/` is expanded; relative paths are relative
 to the config file. Use a fully transparent `background` (`00000000`) to show the
 image untinted. If the image cannot be loaded, a warning is printed and the plain
 color is used.
+
+Shadows match niri's (CSS `box-shadow` semantics, same defaults) and are not
+drawn behind thumbnails, so translucent windows show the background.
 
 ## Protocols
 
@@ -118,8 +125,8 @@ color is used.
 - `wl_subcompositor` + `wp_viewporter`: one subsurface per thumbnail, scaled
   by the compositor
 - `wp_single_pixel_buffer_manager_v1` (optional, falls back to 1x1 shm
-  buffers): background, highlight, placeholders; the background image is a
-  plain `wl_shm` buffer
+  buffers): background, highlight, placeholders; the background image and
+  shadows are plain `wl_shm` buffers
 - `wl_seat` + xkbcommon: input; `wp_cursor_shape_manager_v1` (optional)
 
 ## Build

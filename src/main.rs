@@ -12,6 +12,7 @@ mod ipc;
 mod layout;
 mod options;
 mod overlay;
+mod shadow;
 mod toplevel;
 
 use std::path::Path;
