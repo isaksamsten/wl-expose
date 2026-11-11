@@ -216,15 +216,20 @@ pub fn rounded_rect(w: i32, h: i32, r: f64, color: u32) -> Image {
     let [cr, cg, cb, ca] = color.to_be_bytes().map(|c| c as f64 / 255.0);
     let (hw, hh) = (w as f64 / 2.0, h as f64 / 2.0);
     let mut data = Vec::with_capacity((w * h * 4) as usize);
+    let c = |v: f64, a: f64| (v * a * 255.0).round() as u8;
+    let solid = [c(cb, ca), c(cg, ca), c(cr, ca), c(1.0, ca)];
     for y in 0..h {
+        let dy = ((y as f64 + 0.5 - hh).abs() - (hh - r)).max(0.0);
         for x in 0..w {
             // Signed distance from the pixel center to the rounded rect.
             let dx = ((x as f64 + 0.5 - hw).abs() - (hw - r)).max(0.0);
-            let dy = ((y as f64 + 0.5 - hh).abs() - (hh - r)).max(0.0);
+            if dx == 0.0 && dy == 0.0 && r >= 0.5 {
+                data.extend_from_slice(&solid); // outside the corners
+                continue;
+            }
             let d = (dx * dx + dy * dy).sqrt() - r;
             let a = ca * (0.5 - d).clamp(0.0, 1.0);
-            let c = |v: f64| (v * a * 255.0).round() as u8;
-            data.extend_from_slice(&[c(cb), c(cg), c(cr), c(1.0)]);
+            data.extend_from_slice(&[c(cb, a), c(cg, a), c(cr, a), c(1.0, a)]);
         }
     }
     Image {

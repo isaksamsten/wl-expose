@@ -340,6 +340,9 @@ struct Style {
     gap: f64,
     margin: f64,
     border: i32,
+    /// Highlight corner radius; 0: the 1x1 color buffer is scaled instead.
+    border_radius: i32,
+    highlight_color: u32,
     max_scale: f64,
     shadow: Option<shadow::Settings>,
     /// Logical pixels; 0: no icons.
@@ -424,6 +427,9 @@ pub struct Overlay {
     background: WlBuffer,
     wallpaper: Option<Rc<Wallpaper>>,
     highlight: WlBuffer,
+    /// With a border radius: the attached highlight, and the size and scale
+    /// it was rendered for.
+    rounded_highlight: Option<(WlBuffer, (i32, i32, i32))>,
     placeholder: WlBuffer,
     /// Icon buffers, shared by the windows of an app.
     icon_buffers: HashMap<icons::Key, WlBuffer>,
@@ -551,6 +557,7 @@ impl Overlay {
             background,
             wallpaper,
             highlight,
+            rounded_highlight: None,
             placeholder,
             icon_buffers: HashMap::new(),
             stale_buffers: Vec::new(),
@@ -563,6 +570,8 @@ impl Overlay {
                 gap: config.gap as f64,
                 margin: config.margin as f64,
                 border: config.border as i32,
+                border_radius: config.border_radius as i32,
+                highlight_color: config.highlight,
                 max_scale: config.max_scale,
                 shadow,
                 icon_size: config.icon_size as i32,
@@ -853,24 +862,65 @@ impl Overlay {
     /// Move the highlight and the title pill to the selection.
     pub fn update_highlight(&mut self) {
         let b = self.style.border;
-        let sub = &self.highlight_sub;
-        match self.selected.map(|i| &self.windows[i]) {
-            Some(sel) if sel.rect.w > 0 && sel.rect.h > 0 && b > 0 => {
-                let r = sel.rect;
-                sub.place(IRect {
+        let target = (self.selected.map(|i| &self.windows[i]))
+            .filter(|w| w.rect.w > 0 && w.rect.h > 0 && b > 0)
+            .map(|w| (w.rect, w.sub.surface.clone()));
+        match target {
+            Some((r, above)) => {
+                let rect = IRect {
                     x: r.x - b,
                     y: r.y - b,
                     w: r.w + 2 * b,
                     h: r.h + 2 * b,
-                });
-                sub.subsurface.place_below(&sel.sub.surface);
-                sub.attach(&self.highlight);
+                };
+                if self.style.border_radius > 0 {
+                    self.attach_rounded_highlight(rect.w, rect.h);
+                } else {
+                    self.highlight_sub.attach(&self.highlight);
+                }
+                let sub = &self.highlight_sub;
+                sub.place(rect);
+                sub.subsurface.place_below(&above);
             }
-            _ => sub.surface.attach(None, 0, 0),
+            None => {
+                self.highlight_sub.surface.attach(None, 0, 0);
+                if let Some((old, _)) = self.rounded_highlight.take() {
+                    retire(&old);
+                }
+            }
         }
-        sub.surface.commit();
+        self.highlight_sub.surface.commit();
         self.update_pill();
         self.commit_parent();
+    }
+
+    /// Attach a rounded highlight of `w`x`h` logical pixels, unless the
+    /// attached one already is. Each buffer is attached once (OnceBuffer).
+    fn attach_rounded_highlight(&mut self, w: i32, h: i32) {
+        let s = self.scale;
+        let key = (w, h, s);
+        if self.rounded_highlight.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        let r = (self.style.border_radius * s) as f64;
+        let img = text::rounded_rect(w * s, h * s, r, self.style.highlight_color);
+        let data = OnceBuffer::default();
+        match shm_buffer(&self.g, img.width, img.height, &img.data, data, &self.qh) {
+            Ok(buffer) => {
+                self.highlight_sub.attach(&buffer);
+                if let Some((old, _)) = self.rounded_highlight.replace((buffer, key)) {
+                    retire(&old);
+                }
+            }
+            Err(e) => {
+                eprintln!("wl-expose: highlight buffer: {e}");
+                // Square rather than nothing.
+                self.highlight_sub.attach(&self.highlight);
+                if let Some((old, _)) = self.rounded_highlight.take() {
+                    retire(&old);
+                }
+            }
+        }
     }
 
     /// The selected window, once laid out.
@@ -1081,6 +1131,9 @@ impl Drop for Overlay {
         self.viewport.destroy();
         self.background.destroy();
         self.highlight.destroy();
+        if let Some((buffer, _)) = &self.rounded_highlight {
+            buffer.destroy();
+        }
         self.placeholder.destroy();
         // Like capture buffers, attached ones may be destroyed right away.
         for buffer in self.icon_buffers.values().chain(&self.stale_buffers) {

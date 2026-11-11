@@ -32,6 +32,9 @@ pub struct Config {
     /// Selection border width.
     #[serde(deserialize_with = "px")]
     pub border: u32,
+    /// Selection border corner radius (outer edge); 0: square.
+    #[serde(deserialize_with = "px")]
+    pub border_radius: u32,
     /// Max thumbnail scale.
     #[serde(deserialize_with = "scale")]
     pub max_scale: f64,
@@ -75,6 +78,7 @@ impl Default for Config {
             gap: 24,
             margin: 48,
             border: 4,
+            border_radius: 0,
             max_scale: 1.0,
             shadow_color: 0x00000077,
             shadow_softness: 30,
@@ -262,6 +266,7 @@ mod tests {
             gap = 10
             margin = 0
             border = 2
+            border-radius = 8
             max-scale = 2
             shadow-color = "ff000080"
             shadow-softness = 0
@@ -281,7 +286,7 @@ mod tests {
         assert_eq!(c.background_image.as_deref(), Some(Path::new("wall.png")));
         assert_eq!(c.highlight, 0xff0000ff);
         assert_eq!(c.placeholder, 0x222222ff);
-        assert_eq!((c.gap, c.margin, c.border), (10, 0, 2));
+        assert_eq!((c.gap, c.margin, c.border, c.border_radius), (10, 0, 2, 8));
         assert_eq!(c.max_scale, 2.0);
         assert_eq!(c.shadow_color, 0xff000080);
         assert_eq!(c.shadow_softness, 0);

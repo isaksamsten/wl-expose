@@ -99,6 +99,7 @@ placeholder = "3a3a3aff"    # color of windows without a thumbnail
 gap = 24                    # minimum space between thumbnails, px
 margin = 48                 # space around the layout, px
 border = 4                  # selection border width, px
+border-radius = 0           # selection border corner radius, px
 max-scale = 1.0             # max thumbnail scale
 shadow-color = "00000077"   # alpha 0 disables shadows
 shadow-softness = 30        # shadow blur radius, px
