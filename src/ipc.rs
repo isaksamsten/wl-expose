@@ -17,6 +17,8 @@ pub struct Request {
     pub live: bool,
     pub cursors: bool,
     pub timeout_ms: u32,
+    /// The output to show on, by name.
+    pub output: Option<String>,
 }
 
 impl Default for Request {
@@ -27,6 +29,7 @@ impl Default for Request {
             live: true,
             cursors: false,
             timeout_ms: 500,
+            output: None,
         }
     }
 }
@@ -105,6 +108,9 @@ impl Request {
             out += &line("cursors", None);
         }
         out += &line("timeout", Some(&self.timeout_ms.to_string()));
+        if let Some(output) = &self.output {
+            out += &line("output", Some(output));
+        }
         out += &line("end", None);
         out
     }
@@ -128,6 +134,7 @@ impl Request {
                         .parse()
                         .map_err(|_| format!("'{text}': bad timeout"))?
                 }
+                ("output", p) => req.output = Some(payload(p)?),
                 _ => return Err(format!("unknown request line '{text}'")),
             }
         }
@@ -188,6 +195,7 @@ mod tests {
             live: false,
             cursors: true,
             timeout_ms: 250,
+            output: Some("DP-1".into()),
         };
         assert_eq!(Request::decode(req.encode().as_bytes()), Ok(Some(req)));
         let default = Request::default();

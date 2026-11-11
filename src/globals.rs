@@ -15,6 +15,7 @@ use wayland_protocols::{
         image_capture_source::v1::client::{
             ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
             ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+            ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
         },
         image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
     },
@@ -55,6 +56,7 @@ ignore_events!(
     WpSinglePixelBufferManagerV1,
     ExtForeignToplevelImageCaptureSourceManagerV1,
     ExtImageCaptureSourceV1,
+    ExtOutputImageCaptureSourceManagerV1,
     ExtImageCopyCaptureManagerV1,
     // Only create_immed is used, which has no events but `failed`, and that
     // is a protocol error instead.
@@ -81,6 +83,8 @@ pub struct Globals {
     pub layer_shell: LayerShell,
     pub source_manager: ExtForeignToplevelImageCaptureSourceManagerV1,
     pub copy_manager: ExtImageCopyCaptureManagerV1,
+    /// Optional; without it, the opening transition starts from the wallpaper.
+    pub output_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
     /// Optional; captures fall back to shm.
     pub dmabuf: Option<Dmabuf>,
 }
@@ -129,6 +133,7 @@ impl Globals {
             layer_shell: layer_shell?,
             source_manager: source_manager?,
             copy_manager: copy_manager?,
+            output_source_manager: globals.bind(qh, 1..=1, Ignore).ok(),
             dmabuf: Dmabuf::bind(globals, qh),
         })
     }

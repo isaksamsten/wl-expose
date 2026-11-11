@@ -1,4 +1,6 @@
-//! Per-window capture: one ext_image_copy_capture session, two buffers.
+//! Per-capture state: one ext_image_copy_capture session, two buffers. A
+//! capture shows a window's thumbnail or, once, the output for the opening
+//! transition.
 //!
 //! Frames are captured into the back buffer; on `ready` the buffer is handed
 //! to the overlay (attached to the thumbnail subsurface) and the buffers swap.
@@ -13,7 +15,7 @@
 use smithay_client_toolkit::{dispatch2::Dispatch2, shm::raw::RawPool};
 use wayland_client::{
     Connection, QueueHandle, WEnum,
-    protocol::{wl_buffer::WlBuffer, wl_output::Transform, wl_shm},
+    protocol::{wl_buffer::WlBuffer, wl_output::Transform, wl_output::WlOutput, wl_shm},
 };
 use wayland_protocols::ext::{
     foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -147,7 +149,8 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn new(
+    /// Capture the window `toplevel`.
+    pub fn window(
         id: WindowId,
         toplevel: &ExtForeignToplevelHandleV1,
         g: &Globals,
@@ -156,6 +159,32 @@ impl Capture {
         qh: &QueueHandle<App>,
     ) -> Self {
         let source = g.source_manager.create_source(toplevel, qh, Ignore);
+        Self::new(id, source, g, live, cursors, qh)
+    }
+
+    /// Capture one frame of `output`, without cursors (the compositor draws
+    /// the real one). None without ext_output_image_capture_source_manager_v1.
+    pub fn output(
+        id: WindowId,
+        output: &WlOutput,
+        g: &Globals,
+        qh: &QueueHandle<App>,
+    ) -> Option<Self> {
+        let source = g
+            .output_source_manager
+            .as_ref()?
+            .create_source(output, qh, Ignore);
+        Some(Self::new(id, source, g, false, false, qh))
+    }
+
+    fn new(
+        id: WindowId,
+        source: ExtImageCaptureSourceV1,
+        g: &Globals,
+        live: bool,
+        cursors: bool,
+        qh: &QueueHandle<App>,
+    ) -> Self {
         let options = if cursors {
             Options::PaintCursors
         } else {

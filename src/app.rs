@@ -20,7 +20,10 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::GlobalList,
-    protocol::{wl_output, wl_surface::WlSurface},
+    protocol::{
+        wl_output::{self, WlOutput},
+        wl_surface::WlSurface,
+    },
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 
@@ -175,6 +178,22 @@ impl App {
             .collect()
     }
 
+    /// The output named `name`, or without a name, the only one. None (the
+    /// compositor picks one and there is no screenshot) otherwise.
+    fn output(&self, name: Option<&str>, warn: &mut dyn FnMut(String)) -> Option<WlOutput> {
+        let mut outputs = self.output_state.outputs();
+        let Some(name) = name else {
+            let first = outputs.next();
+            return first.filter(|_| outputs.next().is_none());
+        };
+        let found = outputs
+            .find(|o| (self.output_state.info(o)).is_some_and(|i| i.name.as_deref() == Some(name)));
+        if found.is_none() {
+            warn(format!("no output named '{name}'"));
+        }
+        found
+    }
+
     /// Open the overlay for `req` and start its first-frame timer. Warnings
     /// about the request go to `warn`.
     pub fn show(
@@ -197,9 +216,19 @@ impl App {
             .iter()
             .map(|&i| (handles[i].clone(), toplevels[i].clone()))
             .collect();
+        let output = self.output(req.output.as_deref(), warn);
         let assets = self.assets()?;
-        let mut overlay = Overlay::new(g.clone(), windows, req, config, wallpaper, assets, qh)
-            .map_err(|e| format!("failed to create the overlay: {e}"))?;
+        let mut overlay = Overlay::new(
+            g.clone(),
+            windows,
+            output.as_ref(),
+            req,
+            config,
+            wallpaper,
+            assets,
+            qh,
+        )
+        .map_err(|e| format!("failed to create the overlay: {e}"))?;
         // The first window passed in starts selected, unless --select says otherwise.
         let mut selected = 0;
         if let Some(id) = &req.select {

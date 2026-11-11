@@ -1,20 +1,27 @@
-//! Full-screen layer surface with one subsurface per window thumbnail.
+//! Full-screen layer surface: a card on an opaque background, with one
+//! subsurface per window thumbnail on it.
 //!
-//! The background and placeholders are single-pixel buffers (or 1x1 shm
-//! buffers if the compositor lacks wp_single_pixel_buffer_manager_v1)
-//! scaled with viewports; thumbnails attach the capture buffers directly and
-//! let the compositor scale them. With a background image, the image is the
-//! main surface's buffer (cropped to cover it) and the background color is a
-//! tint subsurface above it. Shadows are up to four shm strips around each
-//! thumbnail, below every thumbnail. App icons (shm, one buffer per app)
-//! sit on the thumbnails' bottom edges, above every thumbnail, and the
-//! selected window's title pill is above everything. Icons and pills are
-//! rendered by the worker thread and attached when they arrive. The selected
-//! thumbnail is raised above the others and zoomed (animated on frame
-//! callbacks), its shadow and icon following it. All subsurfaces have an
+//! The main surface shows the background color, or the background image
+//! blurred and tinted with it. Above it are the card's shadow and the card,
+//! which first shows a screenshot of the output at full size, shrinks all the
+//! way into place over the blurred background, and then shows the background
+//! image (or the card color). Everything else is in `content`, a transparent
+//! subsurface that hides it all until the thumbnails start sliding in.
+//!
+//! Colors are single-pixel buffers (or 1x1 shm buffers if the compositor
+//! lacks wp_single_pixel_buffer_manager_v1) scaled with viewports;
+//! thumbnails attach the capture buffers directly and let the compositor
+//! scale them. Shadows are up to four shm strips around each thumbnail,
+//! below every thumbnail. App icons (shm, one buffer per app) sit on the
+//! thumbnails' bottom edges, above every thumbnail, and the selected
+//! window's title pill is above everything. Icons and pills are rendered by
+//! the worker thread and attached when they arrive. The selected thumbnail
+//! is raised above the others and zoomed (animated on frame callbacks, like
+//! the opening), its shadow and icon following it. All subsurfaces have an
 //! empty input region, so pointer events arrive on the main surface and are
 //! hit-tested here.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -32,8 +39,8 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, Proxy, QueueHandle,
     protocol::{
-        wl_buffer::WlBuffer, wl_output::Transform, wl_shm, wl_subsurface::WlSubsurface,
-        wl_surface::WlSurface,
+        wl_buffer::WlBuffer, wl_output::Transform, wl_output::WlOutput, wl_shm,
+        wl_subsurface::WlSubsurface, wl_surface::WlSurface,
     },
 };
 use wayland_protocols::{
@@ -61,6 +68,10 @@ const DEFAULT_SIZE: (f64, f64) = (800.0, 500.0);
 const PILL_GAP: i32 = 6;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
+
+fn next_window_id() -> WindowId {
+    WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowId(u32);
@@ -388,6 +399,13 @@ struct Style {
     font: String,
     /// None: no title pill.
     title: Option<text::Style>,
+    /// The opening transition; 0: none.
+    open_duration: Duration,
+    /// Card size relative to the output.
+    card_scale: f64,
+    /// The background color; with a wallpaper, its tint.
+    background: u32,
+    background_blur: u32,
 }
 
 impl Style {
@@ -420,33 +438,143 @@ struct ShownPill {
     height: i32,
 }
 
-/// A background image in an shm buffer, shared by every overlay of a daemon.
+/// A background image in an shm buffer, shared by every overlay of a daemon,
+/// with its blurred backgrounds.
 pub struct Wallpaper {
     buffer: WlBuffer,
     width: u32,
     height: u32,
+    /// Holds the pixels, which the blurred backgrounds are made from.
+    pool: RefCell<RawPool>,
+    /// Blurred backgrounds, most recently used first.
+    blurred: RefCell<Vec<(BlurKey, WlBuffer)>>,
 }
+
+/// What a blurred background was made for: output size, blur and tint.
+type BlurKey = (u32, u32, u32, u32);
+
+/// Blurred backgrounds kept per wallpaper (outputs of different sizes).
+const MAX_BLURRED: usize = 4;
 
 impl Wallpaper {
     pub fn new(g: &Globals, img: &Image, qh: &QueueHandle<App>) -> std::io::Result<Self> {
         let mut pool = RawPool::new(img.data.len(), &g.shm).map_err(std::io::Error::other)?;
         pool.mmap()[..img.data.len()].copy_from_slice(&img.data);
         let (w, h) = (img.width as i32, img.height as i32);
-        // The buffer stays valid after the pool is destroyed (on drop).
         let buffer =
             pool.create_buffer(0, w, h, img.stride(), wl_shm::Format::Argb8888, Ignore, qh);
         Ok(Self {
             buffer,
             width: img.width,
             height: img.height,
+            pool: RefCell::new(pool),
+            blurred: RefCell::new(Vec::new()),
         })
+    }
+
+    /// The viewport source that makes the image cover a `w`x`h` rect.
+    fn cover(&self, w: u32, h: u32) -> (f64, f64, f64, f64) {
+        background::cover_source(self.width, self.height, w, h)
+    }
+
+    /// The image blurred by `blur` with `tint` over it, for a `w`x`h`
+    /// output, to be scaled up to it; made once and cached.
+    fn blurred(
+        &self,
+        g: &Globals,
+        (w, h): (u32, u32),
+        blur: u32,
+        tint: u32,
+        qh: &QueueHandle<App>,
+    ) -> std::io::Result<WlBuffer> {
+        let key = (w, h, blur, tint);
+        let mut cache = self.blurred.borrow_mut();
+        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+            let entry = cache.remove(i);
+            let buffer = entry.1.clone();
+            cache.insert(0, entry);
+            return Ok(buffer);
+        }
+        let img = {
+            let mut pool = self.pool.borrow_mut();
+            let len = self.width as usize * self.height as usize * 4;
+            let pixels = background::Pixels {
+                width: self.width,
+                height: self.height,
+                data: &pool.mmap()[..len],
+            };
+            background::blurred(pixels, w, h, blur, tint)
+        };
+        let buffer = shm_buffer(g, img.width, img.height, &img.data, Ignore, qh)?;
+        cache.insert(0, (key, buffer.clone()));
+        // Only the newest one can be attached: one overlay at a time.
+        if cache.len() > MAX_BLURRED
+            && let Some((_, old)) = cache.pop()
+        {
+            old.destroy();
+        }
+        Ok(buffer)
     }
 }
 
 impl Drop for Wallpaper {
     fn drop(&mut self) {
         self.buffer.destroy();
+        for (_, buffer) in self.blurred.get_mut() {
+            buffer.destroy();
+        }
     }
+}
+
+/// The output screenshot the card starts as.
+struct Screenshot {
+    id: WindowId,
+    capture: Capture,
+    /// The frame, once captured: its buffer (owned by `capture`) and transform.
+    frame: Option<(WlBuffer, Transform)>,
+}
+
+/// What the card shows.
+#[derive(Clone, Copy, PartialEq)]
+enum CardShows {
+    Nothing,
+    Screenshot,
+    /// The background image, or the card color without one.
+    Wallpaper,
+}
+
+/// The opening transition, started at `start`.
+#[derive(Clone, Copy)]
+struct Opening {
+    /// When the first frame was shown, from which it runs; None until then,
+    /// as getting the first frame on screen can take long.
+    start: Option<Instant>,
+    /// The card starts as the screenshot at full output size and shrinks;
+    /// otherwise only the thumbnails slide in.
+    shrink: bool,
+}
+
+/// The share of `open-duration` the card takes to shrink into place, as the
+/// screenshot over the blurred background; the thumbnails then slide in over
+/// the rest of it, on the wallpaper.
+const SHRINK_SHARE: f64 = 0.5;
+/// How far below their place, logical pixels, and how small the thumbnails
+/// start.
+const SLIDE_DISTANCE: f64 = 56.0;
+const SLIDE_SCALE: f64 = 0.95;
+
+/// Ease out (cubic), `t` clamped to 0..=1.
+fn ease_out(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// How far along an animation of `duration` is after `elapsed`, 0 to 1.
+fn progress(elapsed: Duration, duration: Duration) -> f64 {
+    if duration.is_zero() {
+        return 1.0;
+    }
+    elapsed.as_secs_f64() / duration.as_secs_f64()
 }
 
 pub struct Overlay {
@@ -458,12 +586,24 @@ pub struct Overlay {
     /// An empty subsurface right above every thumbnail: the selected one is
     /// raised to just below it.
     stack_top: Sub,
-    /// The background color over the wallpaper; None without one.
-    tint_sub: Option<Sub>,
+    /// The parent of every window's subsurfaces and the pill: a transparent
+    /// pixel that hides them all until it is attached.
+    content: Sub,
+    /// The card: the screenshot, then the wallpaper.
+    card: Sub,
+    /// None with shadows disabled.
+    card_shadow: Option<Shadow>,
+    /// Until the card shows the wallpaper; None without one.
+    screenshot: Option<Screenshot>,
     viewport: WpViewport,
     layer: LayerSurface,
+    /// Opaque; the main surface's buffer without a wallpaper.
     background: WlBuffer,
     wallpaper: Option<Rc<Wallpaper>>,
+    /// The card without a wallpaper.
+    card_color: WlBuffer,
+    /// Attached to `content` to show it.
+    transparent: WlBuffer,
     placeholder: WlBuffer,
     /// Icon buffers, shared by the windows of an app.
     icon_buffers: HashMap<icons::Key, WlBuffer>,
@@ -487,23 +627,40 @@ pub struct Overlay {
     deadline_passed: bool,
     /// With WL_EXPOSE_TRACE set: when the overlay was created.
     trace: Option<Instant>,
-    /// A frame callback for the zoom animation is pending.
+    /// A frame callback for an animation is pending.
     frame_pending: bool,
+    /// The card's final rect; the layout is inside it.
+    card_rect: IRect,
+    card_shows: CardShows,
+    /// `content` is attached.
+    content_shown: bool,
+    /// The running opening transition, if any.
+    opening: Option<Opening>,
+    /// The card's way from the full output (0) to `card_rect` (1).
+    shrink: f64,
+    /// The thumbnails' way from below (0) to their place (1).
+    slide: f64,
 }
 
 impl Overlay {
-    /// Create the overlay for `toplevels`, in layout order, and start
-    /// capturing them. Icons and titles come from `assets`.
+    /// Create the overlay for `toplevels`, in layout order, on `output`
+    /// (None: the compositor's choice), and start capturing them and, for
+    /// the opening transition, the output. Icons and titles come from
+    /// `assets`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         g: Rc<Globals>,
         toplevels: Vec<(ExtForeignToplevelHandleV1, Toplevel)>,
+        output: Option<&WlOutput>,
         req: &Request,
         config: &Config,
         wallpaper: Option<Rc<Wallpaper>>,
         assets: Rc<Assets>,
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
-        let background = color_buffer(&g, config.background, qh)?;
+        let background = color_buffer(&g, over_black(config.background), qh)?;
+        let card_color = color_buffer(&g, config.card_color, qh)?;
+        let transparent = color_buffer(&g, 0, qh)?;
         let placeholder = color_buffer(&g, config.placeholder, qh)?;
         // Copied by set_input_region, so it is destroyed at the end of new().
         let no_input = Region::new(&g.compositor).map_err(std::io::Error::other)?;
@@ -516,27 +673,36 @@ impl Overlay {
             surface,
             Layer::Overlay,
             Some("wl-expose"),
-            None,
+            output,
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_size(0, 0);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
-        // Created before the thumbnails, so they start below all of them:
-        // the tint lowest, then every shadow.
-        let tint_sub = (wallpaper.is_some() && config.background & 0xff != 0).then(|| {
-            let sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
-            sub.attach(&background);
-            sub
-        });
+        // Stacking is creation order: the card's shadow, the card, then
+        // everything else in `content`.
         let shadow = config.shadow();
+        let card_shadow = shadow
+            .is_some()
+            .then(|| Shadow::new(&g, layer.wl_surface(), &no_input, qh));
+        let card = Sub::new(&g, layer.wl_surface(), &no_input, qh);
+        let content = Sub::new(&g, layer.wl_surface(), &no_input, qh);
+        content.place(IRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        });
+        let parent = &content.surface;
+
+        // Every shadow below every thumbnail.
         let shadows: Vec<Option<Shadow>> = toplevels
             .iter()
             .map(|_| {
                 shadow
                     .is_some()
-                    .then(|| Shadow::new(&g, layer.wl_surface(), &no_input, qh))
+                    .then(|| Shadow::new(&g, parent, &no_input, qh))
             })
             .collect();
 
@@ -546,11 +712,11 @@ impl Overlay {
             .map(|((handle, toplevel), shadow)| {
                 // Unique across overlays, so late events for a previous
                 // overlay's captures never reach this one's.
-                let id = WindowId(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed));
+                let id = next_window_id();
                 Window {
                     id,
-                    capture: Capture::new(id, &handle, &g, req.live, req.cursors, qh),
-                    sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
+                    capture: Capture::window(id, &handle, &g, req.live, req.cursors, qh),
+                    sub: Sub::new(&g, parent, &no_input, qh),
                     shadow,
                     icon: None,
                     handle,
@@ -564,21 +730,31 @@ impl Overlay {
                 }
             })
             .collect();
-        let stack_top = Sub::new(&g, layer.wl_surface(), &no_input, qh);
+        let stack_top = Sub::new(&g, parent, &no_input, qh);
         // Above every thumbnail, then the pill above everything.
         if config.icon_size > 0 {
             for win in &mut windows {
                 win.icon = Some(Icon {
-                    sub: Sub::new(&g, layer.wl_surface(), &no_input, qh),
+                    sub: Sub::new(&g, parent, &no_input, qh),
                     rect: IRect::default(),
                     attached: None,
                 });
             }
         }
         let title = config.title_style();
-        let pill_sub = title
-            .is_some()
-            .then(|| Sub::new(&g, layer.wl_surface(), &no_input, qh));
+        let pill_sub = title.is_some().then(|| Sub::new(&g, parent, &no_input, qh));
+
+        let screenshot = output
+            .filter(|_| config.open_duration > 0)
+            .and_then(|output| {
+                let id = next_window_id();
+                let capture = Capture::output(id, output, &g, qh)?;
+                Some(Screenshot {
+                    id,
+                    capture,
+                    frame: None,
+                })
+            });
 
         // Initial commit without a buffer; the map happens once frames are in.
         layer.commit();
@@ -588,11 +764,16 @@ impl Overlay {
             selected: None,
             pill_sub,
             stack_top,
-            tint_sub,
+            content,
+            card,
+            card_shadow,
+            screenshot,
             viewport,
             layer,
             background,
             wallpaper,
+            card_color,
+            transparent,
             placeholder,
             icon_buffers: HashMap::new(),
             stale_buffers: Vec::new(),
@@ -612,6 +793,10 @@ impl Overlay {
                 icon_theme: config.icon_theme.clone(),
                 font: config.font.clone(),
                 title,
+                open_duration: Duration::from_millis(config.open_duration.into()),
+                card_scale: config.card_scale,
+                background: config.background,
+                background_blur: config.background_blur,
             },
             width: 0,
             height: 0,
@@ -621,6 +806,12 @@ impl Overlay {
             deadline_passed: false,
             trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
             frame_pending: false,
+            card_rect: IRect::default(),
+            card_shows: CardShows::Nothing,
+            content_shown: false,
+            opening: None,
+            shrink: 1.0,
+            slide: 1.0,
         })
     }
 
@@ -636,10 +827,12 @@ impl Overlay {
         self.windows.iter().position(|w| w.id == id)
     }
 
-    /// Subsurface positions and stacking are applied on the parent commit.
-    /// Before mapping, the map commit takes care of that.
+    /// Subsurface positions and stacking are applied on the parent commit:
+    /// `content` for what is in it, the main surface for the card and
+    /// `content`. Before mapping, the map commit takes care of that.
     fn commit_parent(&self) {
         if self.mapped {
+            self.content.surface.commit();
             self.layer.commit();
         }
     }
@@ -656,27 +849,122 @@ impl Overlay {
         self.height = height;
         if width > 0 && height > 0 {
             self.viewport.set_destination(width as i32, height as i32);
-            if let Some(wp) = &self.wallpaper {
-                let (x, y, w, h) = background::cover_source(wp.width, wp.height, width, height);
-                self.viewport.set_source(x, y, w, h);
-            }
-            if let Some(tint) = &self.tint_sub {
-                tint.place(IRect {
-                    x: 0,
-                    y: 0,
-                    w: width as i32,
-                    h: height as i32,
-                });
-                tint.surface.commit();
-            }
         }
         if !self.mapped {
             return;
         }
         if changed {
+            self.attach_background();
+            self.attach_card();
             self.relayout();
         } else {
             self.layer.commit();
+        }
+    }
+
+    /// Attach the main surface's buffer: the blurred wallpaper with the
+    /// background color over it, or the opaque background color.
+    fn attach_background(&self) {
+        let blurred = (self.wallpaper.as_ref())
+            .filter(|_| self.width > 0 && self.height > 0)
+            .and_then(|wp| {
+                // In buffer pixels, so an unblurred one stays sharp.
+                let s = self.scale.max(1) as u32;
+                let size = (self.width * s, self.height * s);
+                let (blur, tint) = (self.style.background_blur * s, self.style.background);
+                wp.blurred(&self.g, size, blur, tint, &self.qh)
+                    .inspect_err(|e| eprintln!("wl-expose: background buffer: {e}"))
+                    .ok()
+            });
+        let surface = self.layer.wl_surface();
+        surface.attach(Some(blurred.as_ref().unwrap_or(&self.background)), 0, 0);
+        surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    }
+
+    /// Attach what the card shows. Committed by `place_card`.
+    fn attach_card(&self) {
+        let card = &self.card;
+        match self.card_shows {
+            CardShows::Nothing => {}
+            CardShows::Screenshot => {
+                if let Some((buffer, transform)) =
+                    self.screenshot.as_ref().and_then(|s| s.frame.as_ref())
+                {
+                    card.surface.set_buffer_transform(*transform);
+                    card.attach(buffer);
+                }
+            }
+            CardShows::Wallpaper => {
+                card.surface.set_buffer_transform(Transform::Normal);
+                match &self.wallpaper {
+                    Some(wp) if self.width > 0 && self.height > 0 => {
+                        // Cropped like the output, which the card's shape is.
+                        let (x, y, w, h) = wp.cover(self.width, self.height);
+                        card.viewport.set_source(x, y, w, h);
+                        card.attach(&wp.buffer);
+                    }
+                    _ => {
+                        card.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+                        card.attach(&self.card_color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The card shows the wallpaper from now on; the screenshot is released.
+    fn swap_card(&mut self) {
+        if self.card_shows == CardShows::Wallpaper {
+            return;
+        }
+        self.card_shows = CardShows::Wallpaper;
+        self.attach_card();
+        self.card.surface.commit();
+        // Attached buffers may be destroyed; the card keeps its contents
+        // until the new buffer applies.
+        self.screenshot = None;
+        if let Some(t0) = self.trace {
+            trace(t0, format_args!("card swapped to the wallpaper"));
+        }
+    }
+
+    /// Show the windows, icons and pill.
+    fn show_content(&mut self) {
+        if !self.content_shown {
+            self.content_shown = true;
+            self.content.attach(&self.transparent);
+            self.content.surface.commit();
+        }
+    }
+
+    /// The card at its current point of the shrink, and its shadow.
+    fn card_shown_rect(&self) -> IRect {
+        let f = self.card_rect;
+        let t = self.shrink;
+        let lerp = |a: i32, b: i32| (a as f64 + (b - a) as f64 * t).round() as i32;
+        let (x0, y0) = (lerp(0, f.x), lerp(0, f.y));
+        let (x1, y1) = (
+            lerp(self.width as i32, f.x + f.w),
+            lerp(self.height as i32, f.y + f.h),
+        );
+        IRect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(1),
+            h: (y1 - y0).max(1),
+        }
+    }
+
+    /// Place the card and its shadow where they are shown, and commit them.
+    fn place_card(&self) {
+        if self.card_rect.w <= 0 || self.card_rect.h <= 0 {
+            return;
+        }
+        let shown = self.card_shown_rect();
+        self.card.place(shown);
+        self.card.surface.commit();
+        if let Some(sh) = &self.card_shadow {
+            sh.place(self.card_rect, shown);
         }
     }
 
@@ -686,21 +974,45 @@ impl Overlay {
         }
         self.scale = scale;
         if self.mapped {
+            self.attach_background();
             self.relayout();
         }
     }
 
     pub fn relayout(&mut self) {
-        if !self.configured || self.width == 0 || self.height == 0 || self.windows.is_empty() {
+        if !self.configured || self.width == 0 || self.height == 0 {
             self.commit_parent();
             return;
         }
-        let items: Vec<layout::Item> = self.windows.iter().map(|w| w.size(self.scale)).collect();
+        // The output scaled around its center, so the screenshot keeps its
+        // aspect ratio.
         let (width, height) = (self.width as f64, self.height as f64);
+        let s = self.style.card_scale;
+        let (cw, ch) = ((width * s).round().max(1.0), (height * s).round().max(1.0));
+        self.card_rect = IRect {
+            x: ((width - cw) / 2.0).round() as i32,
+            y: ((height - ch) / 2.0).round() as i32,
+            w: cw as i32,
+            h: ch as i32,
+        };
+        if let (Some(sh), Some(settings)) = (&mut self.card_shadow, &self.style.shadow) {
+            let size = (self.card_rect.w, self.card_rect.h);
+            sh.render(&self.g, settings, size, self.scale, &self.qh);
+        }
+        self.place_card();
+        if self.windows.is_empty() {
+            self.commit_parent();
+            return;
+        }
+
+        let items: Vec<layout::Item> = self.windows.iter().map(|w| w.size(self.scale)).collect();
+        let c = self.card_rect;
+        let card = layout::Rect::new(c.x as f64, c.y as f64, c.w as f64, c.h as f64);
         let m = self.style.margin;
-        let mut area = layout::Rect::new(m, m, width - 2.0 * m, height - 2.0 * m);
+        let mut area =
+            layout::Rect::new(card.x + m, card.y + m, card.w - 2.0 * m, card.h - 2.0 * m);
         if area.w <= 0.0 || area.h <= 0.0 {
-            area = layout::Rect::new(0.0, 0.0, width, height);
+            area = card;
         }
         let params = layout::Params {
             spacing: self.style.gap,
@@ -734,24 +1046,55 @@ impl Overlay {
         self.update_selection(); // commits the parent
     }
 
-    /// Where `win` is shown: its layout rect zoomed around its center, kept
-    /// inside the output.
-    fn shown_rect(&self, win: &Window) -> IRect {
+    /// Where `win` ends up: its layout rect zoomed around its center, kept
+    /// inside the card. Input hit-tests this, also during the opening.
+    fn zoomed_rect(&self, win: &Window) -> IRect {
         let r = win.rect;
         if win.zoom == 1.0 {
             return r;
         }
         let w = (r.w as f64 * win.zoom).round().max(1.0) as i32;
         let h = (r.h as f64 * win.zoom).round().max(1.0) as i32;
-        let fit = |pos: i32, size: i32, max: u32| match max as i32 - size {
-            room if room >= 0 => pos.clamp(0, room),
+        let fit = |pos: i32, size: i32, min: i32, max: i32| match max - size {
+            room if room >= min => pos.clamp(min, room),
             _ => pos,
         };
+        let c = self.card_rect;
         IRect {
-            x: fit(r.x - (w - r.w) / 2, w, self.width),
-            y: fit(r.y - (h - r.h) / 2, h, self.height),
+            x: fit(r.x - (w - r.w) / 2, w, c.x, c.x + c.w),
+            y: fit(r.y - (h - r.h) / 2, h, c.y, c.y + c.h),
             w,
             h,
+        }
+    }
+
+    /// Where `win` is shown: zoomed, and during the opening, smaller and
+    /// lower on its way in.
+    fn shown_rect(&self, win: &Window) -> IRect {
+        let r = self.zoomed_rect(win);
+        if self.slide >= 1.0 {
+            return r;
+        }
+        let left = 1.0 - self.slide;
+        let s = 1.0 - (1.0 - SLIDE_SCALE) * left;
+        let w = (r.w as f64 * s).round().max(1.0) as i32;
+        let h = (r.h as f64 * s).round().max(1.0) as i32;
+        IRect {
+            x: r.x + (r.w - w) / 2,
+            y: r.y + (r.h - h) / 2 + (SLIDE_DISTANCE * left).round() as i32,
+            w,
+            h,
+        }
+    }
+
+    /// The icon of a thumbnail shown at `shown`: centered on its bottom edge.
+    fn icon_rect(&self, shown: IRect) -> IRect {
+        let s = self.style.icon_size;
+        IRect {
+            x: shown.x + (shown.w - s) / 2,
+            y: shown.y + shown.h - s / 2,
+            w: s,
+            h: s,
         }
     }
 
@@ -759,7 +1102,7 @@ impl Overlay {
     /// commit them.
     fn place_window(&mut self, i: usize) {
         let shown = self.shown_rect(&self.windows[i]);
-        let s = self.style.icon_size;
+        let icon_rect = self.icon_rect(shown);
         let win = &mut self.windows[i];
         win.sub.place(shown);
         win.sub.surface.commit();
@@ -767,12 +1110,7 @@ impl Overlay {
             sh.place(win.rect, shown);
         }
         if let Some(icon) = &mut win.icon {
-            icon.rect = IRect {
-                x: shown.x + (shown.w - s) / 2,
-                y: shown.y + shown.h - s / 2,
-                w: s,
-                h: s,
-            };
+            icon.rect = icon_rect;
             icon.sub.place(icon.rect);
             icon.sub.surface.commit();
         }
@@ -787,14 +1125,66 @@ impl Overlay {
         }
     }
 
-    /// Start zoom animations toward the current targets, advance them to
-    /// now and place the windows whose zoom changed. Until mapped, zooms
-    /// jump to their targets. The parent commit is the caller's.
+    /// Advance the opening transition to `now`: shrink the card all the way,
+    /// then swap it to the wallpaper, show the windows and slide them in.
+    /// Returns whether it is still running.
+    fn animate_opening(&mut self, now: Instant) -> bool {
+        let Some(o) = self.opening else {
+            return false;
+        };
+        let elapsed = o
+            .start
+            .map_or(Duration::ZERO, |s| now.saturating_duration_since(s));
+        let duration = self.style.open_duration;
+        let shrink_time = if o.shrink {
+            duration.mul_f64(SHRINK_SHARE)
+        } else {
+            Duration::ZERO
+        };
+        let card = progress(elapsed, shrink_time);
+        self.shrink = ease_out(card);
+        let started = elapsed >= shrink_time;
+        if started {
+            // The card is in place: only its contents change, and the
+            // windows start moving.
+            self.swap_card();
+            self.show_content();
+        }
+        let slide_time = duration.saturating_sub(shrink_time);
+        let slide = progress(elapsed.saturating_sub(shrink_time), slide_time);
+        self.slide = if started { ease_out(slide) } else { 0.0 };
+        self.place_card();
+        if let Some(t0) = self.trace {
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            let r = self.card_shown_rect();
+            trace(
+                t0,
+                format_args!(
+                    "opening frame {ms:6.1} ms shrink {:.3} slide {:.3} card {}x{}+{}+{}",
+                    self.shrink, self.slide, r.w, r.h, r.x, r.y
+                ),
+            );
+        }
+        let done = started && card >= 1.0 && slide >= 1.0;
+        if done {
+            self.opening = None;
+            if let Some(t0) = self.trace {
+                trace(t0, format_args!("opening done"));
+            }
+        }
+        !done
+    }
+
+    /// Advance the opening and start zoom animations toward the current
+    /// targets, advance them to now and place the windows that moved.
+    /// Until mapped, zooms jump to their targets. The parent commit is the
+    /// caller's.
     fn animate(&mut self) {
         let now = Instant::now();
+        let opening = self.opening.is_some();
+        let mut running = self.animate_opening(now);
         let duration = self.style.zoom_duration;
         let can_animate = self.mapped && !duration.is_zero();
-        let mut running = false;
         for i in 0..self.windows.len() {
             let target = self.zoom_target(i);
             let win = &mut self.windows[i];
@@ -826,7 +1216,7 @@ impl Overlay {
                     }
                 }
             }
-            if win.zoom != before {
+            if win.zoom != before || opening {
                 self.place_window(i);
             }
         }
@@ -837,9 +1227,18 @@ impl Overlay {
         }
     }
 
-    /// The frame callback of the zoom animation: draw its next step.
+    /// The frame callback of the animations: draw their next step. The first
+    /// one after mapping starts the opening.
     pub fn frame_done(&mut self) {
         self.frame_pending = false;
+        if let Some(o) = &mut self.opening
+            && o.start.is_none()
+        {
+            o.start = Some(Instant::now());
+            if let Some(t0) = self.trace {
+                trace(t0, format_args!("first frame shown, opening starts"));
+            }
+        }
         self.animate();
         self.place_pill();
         self.commit_parent();
@@ -938,12 +1337,16 @@ impl Overlay {
         }
     }
 
-    /// Run `f` on a window's capture and apply what it reports.
+    /// Run `f` on a window's (or the screenshot's) capture and apply what
+    /// it reports.
     pub fn capture_update(
         &mut self,
         id: WindowId,
         f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
     ) {
+        if self.screenshot.as_ref().is_some_and(|s| s.id == id) {
+            return self.screenshot_update(f);
+        }
         let Some(i) = self.index_of(id) else { return };
         let had_size = self.windows[i].capture.size().is_some();
         let had_frame = self.windows[i].shown.is_some();
@@ -976,6 +1379,30 @@ impl Overlay {
         }
     }
 
+    fn screenshot_update(
+        &mut self,
+        f: impl FnOnce(&mut Capture, &Globals) -> Option<CaptureEvent>,
+    ) {
+        let Some(shot) = &mut self.screenshot else {
+            return;
+        };
+        match f(&mut shot.capture, &self.g) {
+            // Static, so the only one; it is shown when the overlay maps.
+            Some(CaptureEvent::Frame(frame)) => {
+                if let Some(t0) = self.trace {
+                    let kind = shot.capture.buffer_kind().unwrap_or("?");
+                    let (w, h) = (frame.width, frame.height);
+                    trace(t0, format_args!("screenshot {w}x{h} ({kind})"));
+                }
+                shot.frame = Some((frame.buffer, frame.transform));
+            }
+            Some(CaptureEvent::Failed(why)) => {
+                eprintln!("wl-expose: output capture failed: {why}");
+                self.screenshot = None; // maybe_map goes on without it
+            }
+            None => {}
+        }
+    }
     fn show_frame(&mut self, i: usize, frame: Frame) {
         let scale = self.scale;
         let win = &mut self.windows[i];
@@ -1023,7 +1450,7 @@ impl Overlay {
             .selected_window()
             .filter(|w| !w.title.trim().is_empty())
             .map(|w| {
-                let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.width as i32);
+                let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.card_rect.w);
                 let request = PillRequest {
                     title: w.title.clone(),
                     max_width,
@@ -1053,7 +1480,7 @@ impl Overlay {
         self.place_pill();
     }
 
-    /// Put the pill below its window's icon, centered and inside the output.
+    /// Put the pill below its window's icon, centered and inside the card.
     fn place_pill(&self) {
         let (Some(sub), Some(pill)) = (&self.pill_sub, &self.pill) else {
             return;
@@ -1062,9 +1489,10 @@ impl Overlay {
             return;
         };
         let r = self.shown_rect(win);
-        let max_x = (self.width as i32 - pill.width).max(0);
+        let c = self.card_rect;
+        let max_x = (c.x + c.w - pill.width).max(c.x);
         sub.place(IRect {
-            x: (r.x + (r.w - pill.width) / 2).clamp(0, max_x),
+            x: (r.x + (r.w - pill.width) / 2).clamp(c.x, max_x),
             y: r.y + r.h + self.style.pill_offset(),
             w: pill.width,
             h: pill.height,
@@ -1115,44 +1543,64 @@ impl Overlay {
         self.maybe_map();
     }
 
-    /// Map once configured and every capture knows its size (frames fill in
-    /// as they arrive), or the deadline passed.
+    /// Map once configured, every capture knows its size (frames fill in
+    /// as they arrive) and the screenshot is in, or the deadline passed.
     pub fn maybe_map(&mut self) {
         if self.mapped || !self.configured {
             return;
         }
-        if !self.deadline_passed && !self.windows.iter().all(|w| w.capture.sized()) {
+        let shot_ready = self.screenshot.as_ref().is_none_or(|s| s.frame.is_some());
+        if !self.deadline_passed && !(shot_ready && self.windows.iter().all(|w| w.capture.sized()))
+        {
             return;
         }
         self.mapped = true;
+        // Without a screenshot, the card starts as the wallpaper in place.
+        let shrink = self.screenshot.as_ref().is_some_and(|s| s.frame.is_some());
+        if !shrink {
+            self.screenshot = None;
+        }
         if let Some(t0) = self.trace {
             let why = if self.deadline_passed {
                 "deadline"
             } else {
                 "all sized"
             };
-            trace(t0, format_args!("mapped ({why})"));
+            let from = if shrink { "screenshot" } else { "wallpaper" };
+            trace(t0, format_args!("mapped ({why}), card from the {from}"));
         }
-        let surface = self.layer.wl_surface();
-        let buffer = match &self.wallpaper {
-            Some(wp) => &wp.buffer,
-            None => &self.background,
-        };
-        surface.attach(Some(buffer), 0, 0);
-        surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        self.attach_background();
+        let animated = !self.style.open_duration.is_zero();
+        self.opening = animated.then_some(Opening {
+            start: None,
+            shrink,
+        });
+        if shrink {
+            // The screen looks unchanged: the card covers the output.
+            self.card_shows = CardShows::Screenshot;
+            (self.shrink, self.slide) = (0.0, 0.0);
+        } else {
+            self.card_shows = CardShows::Wallpaper;
+            self.shrink = 1.0;
+            self.slide = if animated { 0.0 } else { 1.0 };
+            self.show_content();
+        }
+        self.attach_card();
         self.relayout(); // commits the parent, mapping it
     }
 
-    /// The window whose thumbnail or icon is at (`x`, `y`).
+    /// The window whose thumbnail or icon is at (`x`, `y`). Windows are
+    /// where they end up, also while they move in.
     pub fn hit(&self, x: f64, y: f64) -> Option<usize> {
         if !self.mapped {
             return None;
         }
         // Icons are on top, so they win where they cover a thumbnail; the
         // selection is raised and zoomed, so it wins over the others.
-        let on_icon = |w: &Window| w.icon.as_ref().is_some_and(|i| i.rect.contains(x, y));
+        let on_icon =
+            |w: &Window| w.icon.is_some() && self.icon_rect(self.zoomed_rect(w)).contains(x, y);
         let on_selected = (self.selected_window())
-            .filter(|w| self.shown_rect(w).contains(x, y))
+            .filter(|w| self.zoomed_rect(w).contains(x, y))
             .and(self.selected);
         (self.windows.iter().position(on_icon))
             .or(on_selected)
@@ -1220,6 +1668,8 @@ impl Drop for Overlay {
         self.viewport.destroy();
         self.background.destroy();
         self.placeholder.destroy();
+        self.card_color.destroy();
+        self.transparent.destroy();
         // Like capture buffers, attached ones may be destroyed right away.
         for buffer in self.icon_buffers.values().chain(&self.stale_buffers) {
             buffer.destroy();
@@ -1249,4 +1699,36 @@ fn color_buffer(g: &Globals, rgba: u32, qh: &QueueHandle<App>) -> std::io::Resul
     let pixel = c(a) << 24 | c(r) << 16 | c(gr) << 8 | c(b);
     pool.mmap()[..4].copy_from_slice(&pixel.to_le_bytes());
     Ok(pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, Ignore, qh))
+}
+
+/// An 0xRRGGBBAA color drawn over black, opaque.
+fn over_black(rgba: u32) -> u32 {
+    let [r, g, b, a] = rgba.to_be_bytes();
+    let c = |v: u8| ((v as u32 * a as u32 + 127) / 255) as u8;
+    u32::from_be_bytes([c(r), c(g), c(b), 0xff])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_background() {
+        assert_eq!(over_black(0x000000b3), 0x000000ff);
+        assert_eq!(over_black(0xff8000ff), 0xff8000ff);
+        assert_eq!(over_black(0xff000080), 0x800000ff);
+        assert_eq!(over_black(0xffffff00), 0x000000ff);
+    }
+
+    #[test]
+    fn easing() {
+        assert_eq!(ease_out(-1.0), 0.0);
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert_eq!(ease_out(2.0), 1.0);
+        assert!(ease_out(0.5) > 0.5);
+        let ms = Duration::from_millis;
+        assert_eq!(progress(ms(125), ms(250)), 0.5);
+        assert_eq!(progress(ms(1), Duration::ZERO), 1.0);
+    }
 }

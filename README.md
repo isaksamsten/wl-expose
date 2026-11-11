@@ -26,6 +26,7 @@ ids=$(niri msg -j windows | jq -r ".[] | select(.workspace_id == $ws) | .id")
 id=$(wl-expose $ids) &&
     niri msg action focus-window --id "$id"
 ```
+
 Previews use natural window placement adapted from `native_win.js`: native-sized
 windows separate using aspect-aware dodges, then fit with a shared scale while
 reserving the `--gap` minimum in final logical pixels. Native size ratios are
@@ -38,7 +39,6 @@ ordering even with zero-sized thumbnails, it is reduced with a warning to stderr
 The layout is computed before display; there is no continuous physics simulation.
 If separation reaches its 500-pass limit, a warning is written to stderr and a
 deterministic sweep clears any remaining collisions before fitting.
-
 
 ## Controls
 
@@ -104,6 +104,10 @@ shadow-color = "00000077"   # alpha 0 disables shadows
 shadow-softness = 30        # shadow blur radius, px
 shadow-spread = 5           # px, may be negative
 shadow-offset = [0, 5]      # px
+open-duration = 400         # ms
+card-color = "303030ff"     #
+card-scale = 0.9
+background-blur = 0
 ```
 
 `background-image` is scaled to cover the output (centered, cropped to keep its

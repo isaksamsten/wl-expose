@@ -11,12 +11,25 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    /// Overlay color, drawn over the background image if there is one.
+    /// Color outside the card, made opaque over black. With a background
+    /// image, the tint over its blurred copy instead.
     #[serde(deserialize_with = "color")]
     pub background: u32,
-    /// Image scaled to cover the output, below the background color.
+    /// Image scaled to cover the output, shown on the card.
     /// `~/` is expanded; relative paths are relative to the config file.
     pub background_image: Option<PathBuf>,
+    /// Blur of the background image outside the card; 0: none.
+    #[serde(deserialize_with = "px")]
+    pub background_blur: u32,
+    /// Opening transition duration in milliseconds; 0: none.
+    #[serde(deserialize_with = "duration")]
+    pub open_duration: u32,
+    /// Card size relative to the output.
+    #[serde(deserialize_with = "card_scale")]
+    pub card_scale: f64,
+    /// Card color without a background image.
+    #[serde(deserialize_with = "color")]
+    pub card_color: u32,
     /// Color of windows without a thumbnail.
     #[serde(deserialize_with = "color")]
     pub placeholder: u32,
@@ -30,7 +43,7 @@ pub struct Config {
     #[serde(deserialize_with = "zoom")]
     pub zoom: f64,
     /// Zoom animation duration in milliseconds; 0: instant.
-    #[serde(deserialize_with = "zoom_duration")]
+    #[serde(deserialize_with = "duration")]
     pub zoom_duration: u32,
     /// Max thumbnail scale.
     #[serde(deserialize_with = "scale")]
@@ -70,6 +83,10 @@ impl Default for Config {
         Self {
             background: 0x000000b3,
             background_image: None,
+            background_blur: 0,
+            open_duration: 400,
+            card_scale: 0.9,
+            card_color: 0x303030ff,
             placeholder: 0x3a3a3aff,
             gap: 24,
             margin: 48,
@@ -222,8 +239,19 @@ fn icon_size<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     bounded(d, 0, 1024)
 }
 
-fn zoom_duration<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+fn duration<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     bounded(d, 0, 10_000)
+}
+
+fn card_scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(D::Error::custom(format!(
+            "expected more than 0, at most 1, got {v}"
+        )))
+    }
 }
 
 fn zoom<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -270,6 +298,10 @@ mod tests {
             r##"
             background = "#00000080"
             background-image = "wall.png"
+            background-blur = 40
+            open-duration = 0
+            card-scale = 0.8
+            card-color = "101010"
             placeholder = "#222222"
             gap = 10
             margin = 0
@@ -292,6 +324,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.background, 0x00000080);
         assert_eq!(c.background_image.as_deref(), Some(Path::new("wall.png")));
+        assert_eq!((c.background_blur, c.open_duration), (40, 0));
+        assert_eq!((c.card_scale, c.card_color), (0.8, 0x101010ff));
         assert_eq!(c.placeholder, 0x222222ff);
         assert_eq!((c.gap, c.margin), (10, 0));
         assert_eq!((c.zoom, c.zoom_duration), (1.1, 0));
@@ -319,6 +353,9 @@ mod tests {
         assert!(Config::parse("zoom = 0.9").is_err());
         assert!(Config::parse("zoom = 3").is_err());
         assert!(Config::parse("zoom-duration = -1").is_err());
+        assert!(Config::parse("card-scale = 0").is_err());
+        assert!(Config::parse("card-scale = 1.5").is_err());
+        assert!(Config::parse("open-duration = 10001").is_err());
         assert!(Config::parse("unknown = 1").is_err());
         assert!(Config::parse("shadow-spread = 100001").is_err());
         assert!(Config::parse("shadow-offset = [1]").is_err());
