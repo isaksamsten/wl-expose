@@ -36,9 +36,10 @@ pub struct Config {
     /// Minimum space between thumbnails.
     #[serde(deserialize_with = "px")]
     pub gap: u32,
-    /// Space around the layout.
-    #[serde(deserialize_with = "px")]
-    pub margin: u32,
+    /// Space between the card edges and the layout; negative lets
+    /// thumbnails extend past the card (but never off the output).
+    #[serde(deserialize_with = "signed_px")]
+    pub margin: i32,
     /// Zoom factor of the selected thumbnail; 1 disables zooming.
     #[serde(deserialize_with = "zoom")]
     pub zoom: f64,
@@ -304,7 +305,7 @@ mod tests {
             card-color = "101010"
             placeholder = "#222222"
             gap = 10
-            margin = 0
+            margin = -12
             max-scale = 2
             zoom = 1.1
             zoom-duration = 0
@@ -327,7 +328,7 @@ mod tests {
         assert_eq!((c.background_blur, c.open_duration), (40, 0));
         assert_eq!((c.card_scale, c.card_color), (0.8, 0x101010ff));
         assert_eq!(c.placeholder, 0x222222ff);
-        assert_eq!((c.gap, c.margin), (10, 0));
+        assert_eq!((c.gap, c.margin), (10, -12));
         assert_eq!((c.zoom, c.zoom_duration), (1.1, 0));
         assert_eq!(c.max_scale, 2.0);
         assert_eq!(c.shadow_color, 0xff000080);
@@ -347,6 +348,7 @@ mod tests {
     #[test]
     fn invalid() {
         assert!(Config::parse("gap = -1").is_err());
+        assert!(Config::parse("margin = -100001").is_err());
         assert!(Config::parse("gap = 100001").is_err());
         assert!(Config::parse("max-scale = 0").is_err());
         assert!(Config::parse("placeholder = \"red\"").is_err());

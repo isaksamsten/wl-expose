@@ -629,8 +629,12 @@ pub struct Overlay {
     trace: Option<Instant>,
     /// A frame callback for an animation is pending.
     frame_pending: bool,
-    /// The card's final rect; the layout is inside it.
+    /// The card's final rect; the layout is inside it unless the margin is
+    /// negative.
     card_rect: IRect,
+    /// Where thumbnails and pills may go: the card, grown by a negative
+    /// margin, within the output.
+    content_rect: IRect,
     card_shows: CardShows,
     /// `content` is attached.
     content_shown: bool,
@@ -807,6 +811,7 @@ impl Overlay {
             trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
             frame_pending: false,
             card_rect: IRect::default(),
+            content_rect: IRect::default(),
             card_shows: CardShows::Nothing,
             content_shown: false,
             opening: None,
@@ -1000,20 +1005,34 @@ impl Overlay {
             sh.render(&self.g, settings, size, self.scale, &self.qh);
         }
         self.place_card();
+        // A negative margin grows the layout area past the card, but never
+        // off the output.
+        let c = self.card_rect;
+        let card = layout::Rect::new(c.x as f64, c.y as f64, c.w as f64, c.h as f64);
+        let m = self.style.margin;
+        let (x0, y0) = ((card.x + m).max(0.0), (card.y + m).max(0.0));
+        let x1 = (card.x + card.w - m).min(width);
+        let y1 = (card.y + card.h - m).min(height);
+        let mut area = layout::Rect::new(x0, y0, x1 - x0, y1 - y0);
+        if area.w <= 0.0 || area.h <= 0.0 {
+            area = card;
+        }
+        self.content_rect = if m < 0.0 {
+            IRect {
+                x: area.x.round() as i32,
+                y: area.y.round() as i32,
+                w: area.w.round() as i32,
+                h: area.h.round() as i32,
+            }
+        } else {
+            c
+        };
         if self.windows.is_empty() {
             self.commit_parent();
             return;
         }
 
         let items: Vec<layout::Item> = self.windows.iter().map(|w| w.size(self.scale)).collect();
-        let c = self.card_rect;
-        let card = layout::Rect::new(c.x as f64, c.y as f64, c.w as f64, c.h as f64);
-        let m = self.style.margin;
-        let mut area =
-            layout::Rect::new(card.x + m, card.y + m, card.w - 2.0 * m, card.h - 2.0 * m);
-        if area.w <= 0.0 || area.h <= 0.0 {
-            area = card;
-        }
         let params = layout::Params {
             spacing: self.style.gap,
             max_scale: self.style.max_scale,
@@ -1047,7 +1066,7 @@ impl Overlay {
     }
 
     /// Where `win` ends up: its layout rect zoomed around its center, kept
-    /// inside the card. Input hit-tests this, also during the opening.
+    /// inside the content rect. Input hit-tests this, also during the opening.
     fn zoomed_rect(&self, win: &Window) -> IRect {
         let r = win.rect;
         if win.zoom == 1.0 {
@@ -1059,7 +1078,7 @@ impl Overlay {
             room if room >= min => pos.clamp(min, room),
             _ => pos,
         };
-        let c = self.card_rect;
+        let c = self.content_rect;
         IRect {
             x: fit(r.x - (w - r.w) / 2, w, c.x, c.x + c.w),
             y: fit(r.y - (h - r.h) / 2, h, c.y, c.y + c.h),
@@ -1450,7 +1469,7 @@ impl Overlay {
             .selected_window()
             .filter(|w| !w.title.trim().is_empty())
             .map(|w| {
-                let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.card_rect.w);
+                let max_width = w.rect.w.max(text::MIN_PILL_WIDTH).min(self.content_rect.w);
                 let request = PillRequest {
                     title: w.title.clone(),
                     max_width,
@@ -1480,7 +1499,8 @@ impl Overlay {
         self.place_pill();
     }
 
-    /// Put the pill below its window's icon, centered and inside the card.
+    /// Put the pill below its window's icon, centered and inside the content
+    /// rect.
     fn place_pill(&self) {
         let (Some(sub), Some(pill)) = (&self.pill_sub, &self.pill) else {
             return;
@@ -1489,7 +1509,7 @@ impl Overlay {
             return;
         };
         let r = self.shown_rect(win);
-        let c = self.card_rect;
+        let c = self.content_rect;
         let max_x = (c.x + c.w - pill.width).max(c.x);
         sub.place(IRect {
             x: (r.x + (r.w - pill.width) / 2).clamp(c.x, max_x),
