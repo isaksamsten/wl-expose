@@ -364,7 +364,13 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
+        if let Some(overlay) = &mut self.overlay
+            && overlay.surface() == surface
+        {
+            overlay.frame_done();
+        }
+    }
 
     fn surface_enter(
         &mut self,

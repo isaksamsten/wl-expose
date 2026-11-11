@@ -1,7 +1,7 @@
 //! Full-screen layer surface with one subsurface per window thumbnail.
 //!
-//! The background, highlight and placeholders are single-pixel buffers (or
-//! 1x1 shm buffers if the compositor lacks wp_single_pixel_buffer_manager_v1)
+//! The background and placeholders are single-pixel buffers (or 1x1 shm
+//! buffers if the compositor lacks wp_single_pixel_buffer_manager_v1)
 //! scaled with viewports; thumbnails attach the capture buffers directly and
 //! let the compositor scale them. With a background image, the image is the
 //! main surface's buffer (cropped to cover it) and the background color is a
@@ -9,17 +9,19 @@
 //! thumbnail, below every thumbnail. App icons (shm, one buffer per app)
 //! sit on the thumbnails' bottom edges, above every thumbnail, and the
 //! selected window's title pill is above everything. Icons and pills are
-//! rendered by the worker thread and attached when they arrive. All
-//! subsurfaces have an empty input region, so pointer events arrive on the
-//! main surface and are hit-tested here.
+//! rendered by the worker thread and attached when they arrive. The selected
+//! thumbnail is raised above the others and zoomed (animated on frame
+//! callbacks), its shadow and icon following it. All subsurfaces have an
+//! empty input region, so pointer events arrive on the main surface and are
+//! hit-tested here.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
-    compositor::Region,
+    compositor::{FrameCallbackData, Region},
     dispatch2::Dispatch2,
     shell::{
         WaylandSurface,
@@ -153,20 +155,20 @@ impl Shadow {
         }
     }
 
-    /// Follow the thumbnail at `r`; re-render only if its size or the scale
-    /// changed.
-    fn update(
+    /// Render the shadow of a `w`x`h` thumbnail, unless it already is at
+    /// this scale. Committed by `place`.
+    fn render(
         &mut self,
         g: &Globals,
         settings: &shadow::Settings,
-        r: IRect,
+        (w, h): (i32, i32),
         scale: i32,
         qh: &QueueHandle<App>,
     ) {
-        let key = (r.w, r.h, scale);
+        let key = (w, h, scale);
         if self.rendered != Some(key) {
             self.rendered = Some(key);
-            let strips = shadow::render(r.w, r.h, settings, scale);
+            let strips = shadow::render(w, h, settings, scale);
             for (k, strip) in strips.into_iter().enumerate() {
                 if let Some(old) = self.buffers[k].take() {
                     retire(&old);
@@ -187,13 +189,23 @@ impl Shadow {
                 self.buffers[k] = buffer;
             }
         }
+    }
+
+    /// Follow the thumbnail laid out at `base` and shown at `shown`: the
+    /// strips are scaled like the thumbnail rather than re-rendered.
+    fn place(&self, base: IRect, shown: IRect) {
+        let zx = shown.w as f64 / base.w as f64;
+        let zy = shown.h as f64 / base.h as f64;
+        let edge = |v: i32, z: f64| (v as f64 * z).round() as i32;
         for (sub, rect) in self.strips.iter().zip(self.rects) {
             if let Some(s) = rect {
+                let (x0, y0) = (edge(s.x, zx), edge(s.y, zy));
+                let (x1, y1) = (edge(s.x + s.w, zx), edge(s.y + s.h, zy));
                 sub.place(IRect {
-                    x: r.x + s.x,
-                    y: r.y + s.y,
-                    w: s.w,
-                    h: s.h,
+                    x: shown.x + x0,
+                    y: shown.y + y0,
+                    w: (x1 - x0).max(1),
+                    h: (y1 - y0).max(1),
                 });
             }
             sub.surface.commit();
@@ -295,9 +307,34 @@ pub struct Window {
     shadow: Option<Shadow>,
     /// None with icons disabled.
     icon: Option<Icon>,
+    /// Where the layout put the thumbnail, unzoomed.
     pub rect: IRect,
     /// The capture frame attached to the thumbnail; None: the placeholder.
     shown: Option<Shown>,
+    /// Current zoom factor; 1: unzoomed.
+    zoom: f64,
+    /// The running zoom animation, if any.
+    anim: Option<ZoomAnim>,
+}
+
+/// A zoom animation from `from` to `to`, started at `start`.
+#[derive(Clone, Copy)]
+struct ZoomAnim {
+    from: f64,
+    to: f64,
+    start: Instant,
+}
+
+impl ZoomAnim {
+    /// The zoom at `now`, eased out (cubic); None once finished.
+    fn at(&self, now: Instant, duration: Duration) -> Option<f64> {
+        let t = now.saturating_duration_since(self.start).as_secs_f64();
+        let t = t / duration.as_secs_f64().max(f64::MIN_POSITIVE);
+        (t < 1.0).then(|| {
+            let e = 1.0 - (1.0 - t).powi(3);
+            self.from + (self.to - self.from) * e
+        })
+    }
 }
 
 /// A window's app icon, centered on the thumbnail's bottom edge.
@@ -339,10 +376,9 @@ impl Window {
 struct Style {
     gap: f64,
     margin: f64,
-    border: i32,
-    /// Highlight corner radius; 0: the 1x1 color buffer is scaled instead.
-    border_radius: i32,
-    highlight_color: u32,
+    /// Zoom factor of the selected thumbnail; 1: none.
+    zoom: f64,
+    zoom_duration: Duration,
     max_scale: f64,
     shadow: Option<shadow::Settings>,
     /// Logical pixels; 0: no icons.
@@ -419,17 +455,15 @@ pub struct Overlay {
     pub selected: Option<usize>,
     /// The selected window's title; None with titles disabled.
     pill_sub: Option<Sub>,
-    highlight_sub: Sub,
+    /// An empty subsurface right above every thumbnail: the selected one is
+    /// raised to just below it.
+    stack_top: Sub,
     /// The background color over the wallpaper; None without one.
     tint_sub: Option<Sub>,
     viewport: WpViewport,
     layer: LayerSurface,
     background: WlBuffer,
     wallpaper: Option<Rc<Wallpaper>>,
-    highlight: WlBuffer,
-    /// With a border radius: the attached highlight, and the size and scale
-    /// it was rendered for.
-    rounded_highlight: Option<(WlBuffer, (i32, i32, i32))>,
     placeholder: WlBuffer,
     /// Icon buffers, shared by the windows of an app.
     icon_buffers: HashMap<icons::Key, WlBuffer>,
@@ -453,6 +487,8 @@ pub struct Overlay {
     deadline_passed: bool,
     /// With WL_EXPOSE_TRACE set: when the overlay was created.
     trace: Option<Instant>,
+    /// A frame callback for the zoom animation is pending.
+    frame_pending: bool,
 }
 
 impl Overlay {
@@ -468,7 +504,6 @@ impl Overlay {
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
         let background = color_buffer(&g, config.background, qh)?;
-        let highlight = color_buffer(&g, config.highlight, qh)?;
         let placeholder = color_buffer(&g, config.placeholder, qh)?;
         // Copied by set_input_region, so it is destroyed at the end of new().
         let no_input = Region::new(&g.compositor).map_err(std::io::Error::other)?;
@@ -489,7 +524,7 @@ impl Overlay {
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
         // Created before the thumbnails, so they start below all of them:
-        // the tint lowest, then every shadow, then the highlight.
+        // the tint lowest, then every shadow.
         let tint_sub = (wallpaper.is_some() && config.background & 0xff != 0).then(|| {
             let sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
             sub.attach(&background);
@@ -504,7 +539,6 @@ impl Overlay {
                     .then(|| Shadow::new(&g, layer.wl_surface(), &no_input, qh))
             })
             .collect();
-        let highlight_sub = Sub::new(&g, layer.wl_surface(), &no_input, qh);
 
         let mut windows: Vec<Window> = toplevels
             .into_iter()
@@ -525,9 +559,12 @@ impl Overlay {
                     title: toplevel.title,
                     rect: IRect::default(),
                     shown: None,
+                    zoom: 1.0,
+                    anim: None,
                 }
             })
             .collect();
+        let stack_top = Sub::new(&g, layer.wl_surface(), &no_input, qh);
         // Above every thumbnail, then the pill above everything.
         if config.icon_size > 0 {
             for win in &mut windows {
@@ -550,14 +587,12 @@ impl Overlay {
             windows,
             selected: None,
             pill_sub,
-            highlight_sub,
+            stack_top,
             tint_sub,
             viewport,
             layer,
             background,
             wallpaper,
-            highlight,
-            rounded_highlight: None,
             placeholder,
             icon_buffers: HashMap::new(),
             stale_buffers: Vec::new(),
@@ -569,9 +604,8 @@ impl Overlay {
             style: Style {
                 gap: config.gap as f64,
                 margin: config.margin as f64,
-                border: config.border as i32,
-                border_radius: config.border_radius as i32,
-                highlight_color: config.highlight,
+                zoom: config.zoom,
+                zoom_duration: Duration::from_millis(config.zoom_duration.into()),
                 max_scale: config.max_scale,
                 shadow,
                 icon_size: config.icon_size as i32,
@@ -586,6 +620,7 @@ impl Overlay {
             mapped: false,
             deadline_passed: false,
             trace: std::env::var_os("WL_EXPOSE_TRACE").map(|_| Instant::now()),
+            frame_pending: false,
         })
     }
 
@@ -684,27 +719,130 @@ impl Overlay {
                 w: (x1 - x0).max(1),
                 h: (y1 - y0).max(1),
             };
-            win.sub.place(win.rect);
             if win.shown.is_none() {
                 win.sub.attach(&self.placeholder);
             }
-            win.sub.surface.commit();
             if let (Some(sh), Some(settings)) = (&mut win.shadow, &self.style.shadow) {
-                sh.update(&self.g, settings, win.rect, self.scale, &self.qh);
-            }
-            if let Some(icon) = &mut win.icon {
-                let (r, s) = (win.rect, self.style.icon_size);
-                icon.rect = IRect {
-                    x: r.x + (r.w - s) / 2,
-                    y: r.y + r.h - s / 2,
-                    w: s,
-                    h: s,
-                };
-                icon.sub.place(icon.rect);
+                let size = (win.rect.w, win.rect.h);
+                sh.render(&self.g, settings, size, self.scale, &self.qh);
             }
         }
+        for i in 0..self.windows.len() {
+            self.place_window(i); // commits the thumbnail, shadow and icon
+        }
         self.update_icons(); // commits every icon
-        self.update_highlight(); // commits the parent
+        self.update_selection(); // commits the parent
+    }
+
+    /// Where `win` is shown: its layout rect zoomed around its center, kept
+    /// inside the output.
+    fn shown_rect(&self, win: &Window) -> IRect {
+        let r = win.rect;
+        if win.zoom == 1.0 {
+            return r;
+        }
+        let w = (r.w as f64 * win.zoom).round().max(1.0) as i32;
+        let h = (r.h as f64 * win.zoom).round().max(1.0) as i32;
+        let fit = |pos: i32, size: i32, max: u32| match max as i32 - size {
+            room if room >= 0 => pos.clamp(0, room),
+            _ => pos,
+        };
+        IRect {
+            x: fit(r.x - (w - r.w) / 2, w, self.width),
+            y: fit(r.y - (h - r.h) / 2, h, self.height),
+            w,
+            h,
+        }
+    }
+
+    /// Place window `i`'s thumbnail, shadow and icon where it is shown, and
+    /// commit them.
+    fn place_window(&mut self, i: usize) {
+        let shown = self.shown_rect(&self.windows[i]);
+        let s = self.style.icon_size;
+        let win = &mut self.windows[i];
+        win.sub.place(shown);
+        win.sub.surface.commit();
+        if let Some(sh) = &win.shadow {
+            sh.place(win.rect, shown);
+        }
+        if let Some(icon) = &mut win.icon {
+            icon.rect = IRect {
+                x: shown.x + (shown.w - s) / 2,
+                y: shown.y + shown.h - s / 2,
+                w: s,
+                h: s,
+            };
+            icon.sub.place(icon.rect);
+            icon.sub.surface.commit();
+        }
+    }
+
+    /// The zoom window `i` heads for.
+    fn zoom_target(&self, i: usize) -> f64 {
+        if self.selected == Some(i) {
+            self.style.zoom
+        } else {
+            1.0
+        }
+    }
+
+    /// Start zoom animations toward the current targets, advance them to
+    /// now and place the windows whose zoom changed. Until mapped, zooms
+    /// jump to their targets. The parent commit is the caller's.
+    fn animate(&mut self) {
+        let now = Instant::now();
+        let duration = self.style.zoom_duration;
+        let can_animate = self.mapped && !duration.is_zero();
+        let mut running = false;
+        for i in 0..self.windows.len() {
+            let target = self.zoom_target(i);
+            let win = &mut self.windows[i];
+            let before = win.zoom;
+            match win.anim {
+                Some(a) if a.to == target => {}
+                _ if win.zoom == target => win.anim = None,
+                _ if can_animate => {
+                    win.anim = Some(ZoomAnim {
+                        from: win.zoom,
+                        to: target,
+                        start: now,
+                    });
+                }
+                _ => {
+                    win.anim = None;
+                    win.zoom = target;
+                }
+            }
+            if let Some(a) = win.anim {
+                match a.at(now, duration) {
+                    Some(z) => {
+                        win.zoom = z;
+                        running = true;
+                    }
+                    None => {
+                        win.zoom = a.to;
+                        win.anim = None;
+                    }
+                }
+            }
+            if win.zoom != before {
+                self.place_window(i);
+            }
+        }
+        if running && self.mapped && !self.frame_pending {
+            let surface = self.layer.wl_surface();
+            surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+            self.frame_pending = true;
+        }
+    }
+
+    /// The frame callback of the zoom animation: draw its next step.
+    pub fn frame_done(&mut self) {
+        self.frame_pending = false;
+        self.animate();
+        self.place_pill();
+        self.commit_parent();
     }
 
     /// The icon key of `app_id` at the current scale.
@@ -859,68 +997,14 @@ impl Overlay {
         }
     }
 
-    /// Move the highlight and the title pill to the selection.
-    pub fn update_highlight(&mut self) {
-        let b = self.style.border;
-        let target = (self.selected.map(|i| &self.windows[i]))
-            .filter(|w| w.rect.w > 0 && w.rect.h > 0 && b > 0)
-            .map(|w| (w.rect, w.sub.surface.clone()));
-        match target {
-            Some((r, above)) => {
-                let rect = IRect {
-                    x: r.x - b,
-                    y: r.y - b,
-                    w: r.w + 2 * b,
-                    h: r.h + 2 * b,
-                };
-                if self.style.border_radius > 0 {
-                    self.attach_rounded_highlight(rect.w, rect.h);
-                } else {
-                    self.highlight_sub.attach(&self.highlight);
-                }
-                let sub = &self.highlight_sub;
-                sub.place(rect);
-                sub.subsurface.place_below(&above);
-            }
-            None => {
-                self.highlight_sub.surface.attach(None, 0, 0);
-                if let Some((old, _)) = self.rounded_highlight.take() {
-                    retire(&old);
-                }
-            }
+    /// Raise and zoom the selection, and move the title pill to it.
+    pub fn update_selection(&mut self) {
+        if let Some(win) = self.selected.and_then(|i| self.windows.get(i)) {
+            win.sub.subsurface.place_below(&self.stack_top.surface);
         }
-        self.highlight_sub.surface.commit();
+        self.animate();
         self.update_pill();
         self.commit_parent();
-    }
-
-    /// Attach a rounded highlight of `w`x`h` logical pixels, unless the
-    /// attached one already is. Each buffer is attached once (OnceBuffer).
-    fn attach_rounded_highlight(&mut self, w: i32, h: i32) {
-        let s = self.scale;
-        let key = (w, h, s);
-        if self.rounded_highlight.as_ref().is_some_and(|(_, k)| *k == key) {
-            return;
-        }
-        let r = (self.style.border_radius * s) as f64;
-        let img = text::rounded_rect(w * s, h * s, r, self.style.highlight_color);
-        let data = OnceBuffer::default();
-        match shm_buffer(&self.g, img.width, img.height, &img.data, data, &self.qh) {
-            Ok(buffer) => {
-                self.highlight_sub.attach(&buffer);
-                if let Some((old, _)) = self.rounded_highlight.replace((buffer, key)) {
-                    retire(&old);
-                }
-            }
-            Err(e) => {
-                eprintln!("wl-expose: highlight buffer: {e}");
-                // Square rather than nothing.
-                self.highlight_sub.attach(&self.highlight);
-                if let Some((old, _)) = self.rounded_highlight.take() {
-                    retire(&old);
-                }
-            }
-        }
     }
 
     /// The selected window, once laid out.
@@ -977,7 +1061,7 @@ impl Overlay {
         let Some(win) = self.windows.iter().find(|w| w.id == pill.window) else {
             return;
         };
-        let r = win.rect;
+        let r = self.shown_rect(win);
         let max_x = (self.width as i32 - pill.width).max(0);
         sub.place(IRect {
             x: (r.x + (r.w - pill.width) / 2).clamp(0, max_x),
@@ -1064,16 +1148,21 @@ impl Overlay {
         if !self.mapped {
             return None;
         }
-        // Icons are on top, so they win where they cover a thumbnail.
+        // Icons are on top, so they win where they cover a thumbnail; the
+        // selection is raised and zoomed, so it wins over the others.
         let on_icon = |w: &Window| w.icon.as_ref().is_some_and(|i| i.rect.contains(x, y));
+        let on_selected = (self.selected_window())
+            .filter(|w| self.shown_rect(w).contains(x, y))
+            .and(self.selected);
         (self.windows.iter().position(on_icon))
+            .or(on_selected)
             .or_else(|| self.windows.iter().position(|w| w.rect.contains(x, y)))
     }
 
     pub fn select(&mut self, i: usize) {
         if i < self.windows.len() && self.selected != Some(i) {
             self.selected = Some(i);
-            self.update_highlight();
+            self.update_selection();
         }
     }
 
@@ -1130,10 +1219,6 @@ impl Drop for Overlay {
     fn drop(&mut self) {
         self.viewport.destroy();
         self.background.destroy();
-        self.highlight.destroy();
-        if let Some((buffer, _)) = &self.rounded_highlight {
-            buffer.destroy();
-        }
         self.placeholder.destroy();
         // Like capture buffers, attached ones may be destroyed right away.
         for buffer in self.icon_buffers.values().chain(&self.stale_buffers) {

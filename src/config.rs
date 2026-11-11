@@ -17,9 +17,6 @@ pub struct Config {
     /// Image scaled to cover the output, below the background color.
     /// `~/` is expanded; relative paths are relative to the config file.
     pub background_image: Option<PathBuf>,
-    /// Selection border color.
-    #[serde(deserialize_with = "color")]
-    pub highlight: u32,
     /// Color of windows without a thumbnail.
     #[serde(deserialize_with = "color")]
     pub placeholder: u32,
@@ -29,12 +26,12 @@ pub struct Config {
     /// Space around the layout.
     #[serde(deserialize_with = "px")]
     pub margin: u32,
-    /// Selection border width.
-    #[serde(deserialize_with = "px")]
-    pub border: u32,
-    /// Selection border corner radius (outer edge); 0: square.
-    #[serde(deserialize_with = "px")]
-    pub border_radius: u32,
+    /// Zoom factor of the selected thumbnail; 1 disables zooming.
+    #[serde(deserialize_with = "zoom")]
+    pub zoom: f64,
+    /// Zoom animation duration in milliseconds; 0: instant.
+    #[serde(deserialize_with = "zoom_duration")]
+    pub zoom_duration: u32,
     /// Max thumbnail scale.
     #[serde(deserialize_with = "scale")]
     pub max_scale: f64,
@@ -73,12 +70,11 @@ impl Default for Config {
         Self {
             background: 0x000000b3,
             background_image: None,
-            highlight: 0x4c8dffff,
             placeholder: 0x3a3a3aff,
             gap: 24,
             margin: 48,
-            border: 4,
-            border_radius: 0,
+            zoom: 1.08,
+            zoom_duration: 150,
             max_scale: 1.0,
             shadow_color: 0x00000077,
             shadow_softness: 30,
@@ -226,6 +222,19 @@ fn icon_size<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     bounded(d, 0, 1024)
 }
 
+fn zoom_duration<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    bounded(d, 0, 10_000)
+}
+
+fn zoom<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if (1.0..=2.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(D::Error::custom(format!("expected 1-2, got {v}")))
+    }
+}
+
 fn scale<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     let v = f64::deserialize(d)?;
     if v > 0.0 && v.is_finite() {
@@ -261,13 +270,12 @@ mod tests {
             r##"
             background = "#00000080"
             background-image = "wall.png"
-            highlight = "ff0000"
             placeholder = "#222222"
             gap = 10
             margin = 0
-            border = 2
-            border-radius = 8
             max-scale = 2
+            zoom = 1.1
+            zoom-duration = 0
             shadow-color = "ff000080"
             shadow-softness = 0
             shadow-spread = -3
@@ -284,9 +292,9 @@ mod tests {
         .unwrap();
         assert_eq!(c.background, 0x00000080);
         assert_eq!(c.background_image.as_deref(), Some(Path::new("wall.png")));
-        assert_eq!(c.highlight, 0xff0000ff);
         assert_eq!(c.placeholder, 0x222222ff);
-        assert_eq!((c.gap, c.margin, c.border, c.border_radius), (10, 0, 2, 8));
+        assert_eq!((c.gap, c.margin), (10, 0));
+        assert_eq!((c.zoom, c.zoom_duration), (1.1, 0));
         assert_eq!(c.max_scale, 2.0);
         assert_eq!(c.shadow_color, 0xff000080);
         assert_eq!(c.shadow_softness, 0);
@@ -307,7 +315,10 @@ mod tests {
         assert!(Config::parse("gap = -1").is_err());
         assert!(Config::parse("gap = 100001").is_err());
         assert!(Config::parse("max-scale = 0").is_err());
-        assert!(Config::parse("highlight = \"red\"").is_err());
+        assert!(Config::parse("placeholder = \"red\"").is_err());
+        assert!(Config::parse("zoom = 0.9").is_err());
+        assert!(Config::parse("zoom = 3").is_err());
+        assert!(Config::parse("zoom-duration = -1").is_err());
         assert!(Config::parse("unknown = 1").is_err());
         assert!(Config::parse("shadow-spread = 100001").is_err());
         assert!(Config::parse("shadow-offset = [1]").is_err());

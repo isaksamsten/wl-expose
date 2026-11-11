@@ -94,12 +94,11 @@ or without a leading `#`.
 ```toml
 background = "000000b3"     # overlay color; tints the image if one is set
 # background-image = "~/Pictures/wall.png"  # PNG, JPEG or WebP
-highlight = "4c8dffff"      # selection border color
 placeholder = "3a3a3aff"    # color of windows without a thumbnail
 gap = 24                    # minimum space between thumbnails, px
 margin = 48                 # space around the layout, px
-border = 4                  # selection border width, px
-border-radius = 0           # selection border corner radius, px
+zoom = 1.08                 # zoom factor of the selected thumbnail; 1 disables
+zoom-duration = 150         # zoom animation, ms; 0 is instant
 max-scale = 1.0             # max thumbnail scale
 shadow-color = "00000077"   # alpha 0 disables shadows
 shadow-softness = 30        # shadow blur radius, px
@@ -126,8 +125,8 @@ drawn behind thumbnails, so translucent windows show the background.
 - `wl_subcompositor` + `wp_viewporter`: one subsurface per thumbnail, scaled
   by the compositor
 - `wp_single_pixel_buffer_manager_v1` (optional, falls back to 1x1 shm
-  buffers): background, highlight, placeholders; the background image and
-  shadows are plain `wl_shm` buffers
+  buffers): background, placeholders; the background image and shadows are
+  plain `wl_shm` buffers
 - `wl_seat` + xkbcommon: input; `wp_cursor_shape_manager_v1` (optional)
 
 ## Build
