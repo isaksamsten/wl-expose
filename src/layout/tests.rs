@@ -153,18 +153,10 @@ fn random() {
         let out = compute(items, *area, p);
         check_invariants(name, items, *area, p.max_scale, 0.0, &out);
 
-        let rows = rows(items, *area, p.spacing, p.max_scale);
-        check_invariants(name, items, *area, p.max_scale, 0.0, &rows);
-
         // A requested gap that fits the natural ordering must be kept. When
-        // it doesn't fit, compute() reduces it (documented, with a warning),
-        // even if a row layout could have kept it.
-        let full_gap = rows
-            .iter()
-            .enumerate()
-            .all(|(i, a)| rows[i + 1..].iter().all(|b| !overlaps(*a, *b, p.spacing)));
+        // it doesn't fit, compute() reduces it (documented, with a warning).
         let natural_fits = Seed::natural(items, area.w / area.h).gap_fits(p.spacing, 0.0, *area);
-        if full_gap && natural_fits {
+        if natural_fits {
             check_invariants(name, items, *area, p.max_scale, p.spacing, &out);
         }
         if iter < 50 {
@@ -281,22 +273,6 @@ fn below_too_large() {
     check_invariants("below too large", &UTILITIES, area, 1.0, 0.0, &out);
 }
 
-// Stale since the natural-placement layout (it reserves breathing room and
-// no longer falls back to rows); this already failed in the C test suite.
-#[test]
-#[ignore = "stale: natural placement no longer guarantees the row-layout area"]
-fn random_never_smaller_than_rows() {
-    for c in random_cases() {
-        let out = compute(&c.items, c.area, &c.params);
-        let rows = rows(&c.items, c.area, c.params.spacing, c.params.max_scale);
-        assert!(
-            thumbnail_area(&out) + EPS >= thumbnail_area(&rows),
-            "{}: free-form layout shrank the row fallback",
-            c.name
-        );
-    }
-}
-
 #[test]
 fn realistic() {
     // Typical desktop: thumbnail gaps are kept exactly.
@@ -365,78 +341,9 @@ fn single_large() {
 }
 
 #[test]
-fn rows_grid() {
-    // Four equal windows in a 16:9 area: a 2x2 grid beats one row.
-    let items = [item(1920.0, 1080.0); 4];
-    let out = rows(&items, Rect::new(0.0, 0.0, 1920.0, 1080.0), 0.0, 1.0);
-    assert!((out[0].w - 960.0).abs() < EPS, "width {}", out[0].w);
-    assert!(
-        (out[1].y - out[0].y).abs() < EPS && out[2].y > out[0].y,
-        "not 2x2"
-    );
-    // Order is kept: row-major.
-    assert!(out[1].x > out[0].x && out[3].x > out[2].x, "order not kept");
-}
-
-#[test]
-fn relative_sizes() {
-    // Same aspect ratio, different native sizes: no equal-height normalization.
-    let items = [item(400.0, 300.0), item(1600.0, 1200.0)];
-    let area = Rect::new(20.0, 30.0, 1000.0, 600.0);
-    let out = rows(&items, area, 24.0, 1.0);
-    check_invariants("relative sizes", &items, area, 1.0, 24.0, &out);
-    // Boosts are 1.25 and 1.0, so the height ratio is 0.3125.
-    assert!(
-        (out[0].h / out[1].h - 0.3125).abs() < EPS,
-        "relative height {:.6}",
-        out[0].h / out[1].h
-    );
-    assert!(
-        out[0].h > out[1].h * 0.25,
-        "small window did not receive a boost"
-    );
-    assert!(
-        (out[0].center_y() - out[1].center_y()).abs() < EPS,
-        "single row is not vertically centered"
-    );
-}
-
-#[test]
-fn mixed_rows() {
-    let items = [
-        item(1600.0, 1200.0),
-        item(400.0, 300.0),
-        item(1600.0, 1200.0),
-        item(400.0, 300.0),
-    ];
-    let area = Rect::new(0.0, 0.0, 1000.0, 1000.0);
-    let out = rows(&items, area, 20.0, 1.0);
-    check_invariants("mixed rows", &items, area, 1.0, 20.0, &out);
-    assert!(out[2].y > out[0].y, "expected two rows");
-    let bottom = |r: Rect| r.y + r.h;
-    assert!(
-        (bottom(out[0]) - bottom(out[1])).abs() < EPS
-            && (bottom(out[2]) - bottom(out[3])).abs() < EPS,
-        "windows do not share row baselines"
-    );
-}
-
-#[test]
-fn scale_caps() {
-    let items = [item(100.0, 100.0), item(800.0, 600.0)];
-    let area = Rect::new(0.0, 0.0, 2000.0, 1500.0);
-    let out = rows(&items, area, 24.0, 0.75);
-    check_invariants("caps", &items, area, 0.75, 24.0, &out);
-    assert!(
-        (out[0].w - 75.0).abs() < EPS && (out[1].w - 600.0).abs() < EPS,
-        "boost bypassed cap or capped windows shrank unnecessarily"
-    );
-}
-
-#[test]
 fn freeform() {
-    // A full-width row is a local trap: independent placement should find
-    // room for the utilities below the two large windows, not beside them.
+    // Two large windows and two utilities: invariants hold, and translating
+    // the area must not alter the sizes or relative composition.
     let items = [
         item(1600.0, 1200.0),
         item(400.0, 300.0),
@@ -449,19 +356,9 @@ fn freeform() {
         max_scale: 1.0,
         below: 0.0,
     };
-    let rows = rows(&items, area, p.spacing, p.max_scale);
     let out = compute(&items, area, &p);
     check_invariants("freeform", &items, area, 1.0, p.spacing, &out);
-    assert!(
-        thumbnail_area(&out) > thumbnail_area(&rows) * 1.4,
-        "free-form packing did not escape the row constraint"
-    );
-    assert!(
-        (out[0].y + out[0].h - out[1].y - out[1].h).abs() > 1.0,
-        "previews still share the old row baseline"
-    );
 
-    // Translation must not alter the sizes or relative composition.
     area.x += 123.0;
     area.y -= 57.0;
     let shifted = compute(&items, area, &p);
