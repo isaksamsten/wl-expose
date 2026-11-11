@@ -558,10 +558,15 @@ struct Opening {
 /// screenshot over the blurred background; the thumbnails then slide in over
 /// the rest of it, on the wallpaper.
 const SHRINK_SHARE: f64 = 0.5;
-/// How far below their place, logical pixels, and how small the thumbnails
-/// start.
-const SLIDE_DISTANCE: f64 = 56.0;
-const SLIDE_SCALE: f64 = 0.95;
+/// The share of the shrink still left when the card swaps to the wallpaper
+/// and the thumbnails start spreading: eased out, the card has nearly
+/// arrived by then and finishes under them.
+const SPREAD_OVERLAP: f64 = 0.3;
+/// How far toward the center of the content the thumbnails start, as a
+/// share of their distance to it (1 = all start at the center), and how
+/// small they start; they spread outward to their places.
+const SPREAD_FROM_CENTER: f64 = 0.6;
+const SLIDE_SCALE: f64 = 0.8;
 
 /// Ease out (cubic), `t` clamped to 0..=1.
 fn ease_out(t: f64) -> f64 {
@@ -642,7 +647,7 @@ pub struct Overlay {
     opening: Option<Opening>,
     /// The card's way from the full output (0) to `card_rect` (1).
     shrink: f64,
-    /// The thumbnails' way from below (0) to their place (1).
+    /// The thumbnails' way out from near the center (0) to their place (1).
     slide: f64,
 }
 
@@ -1088,7 +1093,7 @@ impl Overlay {
     }
 
     /// Where `win` is shown: zoomed, and during the opening, smaller and
-    /// lower on its way in.
+    /// pulled toward the center on its way out to its place.
     fn shown_rect(&self, win: &Window) -> IRect {
         let r = self.zoomed_rect(win);
         if self.slide >= 1.0 {
@@ -1098,9 +1103,22 @@ impl Overlay {
         let s = 1.0 - (1.0 - SLIDE_SCALE) * left;
         let w = (r.w as f64 * s).round().max(1.0) as i32;
         let h = (r.h as f64 * s).round().max(1.0) as i32;
+        // Offset of the window's center from the content's center, pulled
+        // in by the share still left to go.
+        let c = self.content_rect;
+        let (cx, cy) = (
+            c.x as f64 + c.w as f64 / 2.0,
+            c.y as f64 + c.h as f64 / 2.0,
+        );
+        let (rx, ry) = (
+            r.x as f64 + r.w as f64 / 2.0,
+            r.y as f64 + r.h as f64 / 2.0,
+        );
+        let pull = SPREAD_FROM_CENTER * left;
+        let (x, y) = (rx + (cx - rx) * pull, ry + (cy - ry) * pull);
         IRect {
-            x: r.x + (r.w - w) / 2,
-            y: r.y + (r.h - h) / 2 + (SLIDE_DISTANCE * left).round() as i32,
+            x: (x - w as f64 / 2.0).round() as i32,
+            y: (y - h as f64 / 2.0).round() as i32,
             w,
             h,
         }
@@ -1144,9 +1162,9 @@ impl Overlay {
         }
     }
 
-    /// Advance the opening transition to `now`: shrink the card all the way,
-    /// then swap it to the wallpaper, show the windows and slide them in.
-    /// Returns whether it is still running.
+    /// Advance the opening transition to `now`: shrink the card, and near
+    /// the end of it swap it to the wallpaper, show the windows and spread
+    /// them out while the card settles. Returns whether it is still running.
     fn animate_opening(&mut self, now: Instant) -> bool {
         let Some(o) = self.opening else {
             return false;
@@ -1162,15 +1180,16 @@ impl Overlay {
         };
         let card = progress(elapsed, shrink_time);
         self.shrink = ease_out(card);
-        let started = elapsed >= shrink_time;
+        let spread_start = shrink_time.mul_f64(1.0 - SPREAD_OVERLAP);
+        let started = elapsed >= spread_start;
         if started {
-            // The card is in place: only its contents change, and the
+            // The card is (nearly) in place: its contents change, and the
             // windows start moving.
             self.swap_card();
             self.show_content();
         }
-        let slide_time = duration.saturating_sub(shrink_time);
-        let slide = progress(elapsed.saturating_sub(shrink_time), slide_time);
+        let slide_time = duration.saturating_sub(spread_start);
+        let slide = progress(elapsed.saturating_sub(spread_start), slide_time);
         self.slide = if started { ease_out(slide) } else { 0.0 };
         self.place_card();
         if let Some(t0) = self.trace {
