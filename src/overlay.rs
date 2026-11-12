@@ -557,11 +557,11 @@ struct Opening {
 /// The share of `open-duration` the card takes to shrink into place, as the
 /// screenshot over the blurred background; the thumbnails then slide in over
 /// the rest of it, on the wallpaper.
-const SHRINK_SHARE: f64 = 0.5;
+const SHRINK_SHARE: f64 = 0.4;
 /// The share of the shrink still left when the card swaps to the wallpaper
 /// and the thumbnails start spreading: eased out, the card has nearly
 /// arrived by then and finishes under them.
-const SPREAD_OVERLAP: f64 = 0.3;
+const SPREAD_OVERLAP: f64 = 0.4;
 /// How far toward the center of the content the thumbnails start, as a
 /// share of their distance to it (1 = all start at the center), and how
 /// small they start; they spread outward to their places.
@@ -1106,14 +1106,8 @@ impl Overlay {
         // Offset of the window's center from the content's center, pulled
         // in by the share still left to go.
         let c = self.content_rect;
-        let (cx, cy) = (
-            c.x as f64 + c.w as f64 / 2.0,
-            c.y as f64 + c.h as f64 / 2.0,
-        );
-        let (rx, ry) = (
-            r.x as f64 + r.w as f64 / 2.0,
-            r.y as f64 + r.h as f64 / 2.0,
-        );
+        let (cx, cy) = (c.x as f64 + c.w as f64 / 2.0, c.y as f64 + c.h as f64 / 2.0);
+        let (rx, ry) = (r.x as f64 + r.w as f64 / 2.0, r.y as f64 + r.h as f64 / 2.0);
         let pull = SPREAD_FROM_CENTER * left;
         let (x, y) = (rx + (cx - rx) * pull, ry + (cy - ry) * pull);
         IRect {

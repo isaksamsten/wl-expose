@@ -241,6 +241,30 @@ impl Seed {
             );
             finish_separation(&mut rects, aspect, 50.0);
         }
+        Self::from_rects(rects)
+    }
+
+    /// Native-sized rects in rows of `cols`, in input order, each row
+    /// centered. A compact fallback when the natural shape wastes space.
+    fn grid(items: &[Item], cols: usize) -> Self {
+        const GAP: f64 = 50.0;
+        let mut rects = Vec::with_capacity(items.len());
+        let mut y = 0.0;
+        for row in items.chunks(cols.max(1)) {
+            let row_w = row.iter().map(item_w).sum::<f64>() + GAP * (row.len() - 1) as f64;
+            let row_h = row.iter().map(item_h).fold(0.0, f64::max);
+            let mut x = -row_w / 2.0;
+            for it in row {
+                let (w, h) = (item_w(it), item_h(it));
+                rects.push(Rect::new(x, y + (row_h - h) / 2.0, w, h));
+                x += w + GAP;
+            }
+            y += row_h + GAP;
+        }
+        Self::from_rects(rects)
+    }
+
+    fn from_rects(rects: Vec<Rect>) -> Self {
         let x_order = center_order(&rects, true);
         let y_order = center_order(&rects, false);
         Self {
@@ -392,17 +416,65 @@ pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
         );
     }
 
+    // The natural arrangement's shape decides how far it can grow: two wide
+    // windows stacked in a wide area waste most of it. Also try natural
+    // arrangements aimed at other shapes, and plain grids, and keep whichever
+    // fits the largest shared scale. Every candidate must keep the (possibly
+    // reduced) gap and `below`; the screen-shaped seed always can.
+    let fill = if n == 1 { 1.0 } else { 0.95 };
+    let mut best_scale = fit_scale(&seed, area, gap, below, fill, params.max_scale);
+    let mut best = seed;
+    if n > 1 {
+        let shapes = SHAPES
+            .iter()
+            .map(|f| Seed::natural(items, area.w / area.h * f));
+        let grids = (1..=n.min(MAX_GRID_COLS)).map(|cols| Seed::grid(items, cols));
+        for candidate in shapes.chain(grids) {
+            if !candidate.gap_fits(gap, below, area) {
+                continue;
+            }
+            let scale = fit_scale(&candidate, area, gap, below, fill, params.max_scale);
+            // Strictly better by a margin, so near-ties keep the earlier,
+            // more natural arrangement.
+            if scale > best_scale * 1.01 {
+                best_scale = scale;
+                best = candidate;
+            }
+        }
+    }
+
+    let mut out = trial;
+    best.place(best_scale, gap, below, &mut out);
+    spread(&mut out, area);
+    // Footprints to thumbnails; exactly the scaled height, not a difference.
+    for (r, s) in out.iter_mut().zip(&best.rects) {
+        r.h = s.h * best_scale;
+    }
+    out
+}
+
+/// Target aspect ratios tried besides the area's own, relative to it.
+/// Ordered by preference: closer to the screen shape first.
+const SHAPES: [f64; 6] = [0.7, 1.4, 0.5, 2.0, 2.8, 4.0];
+
+/// Grid candidates are tried with 1 up to this many columns.
+const MAX_GRID_COLS: usize = 12;
+
+/// The largest shared scale at which `seed`'s footprints fit `fill` of the
+/// space left in `area` after fixed gap and `below` costs, capped at
+/// `max_scale` (<= 0: no cap).
+fn fit_scale(seed: &Seed, area: Rect, gap: f64, below: f64, fill: f64, max_scale: f64) -> f64 {
+    let mut trial = vec![Rect::default(); seed.rects.len()];
     let minimum = seed.place(0.0, gap, below, &mut trial);
     // Reserve a little of the size budget for breathing room. Fixed gap costs
     // are excluded, so this remains feasible even in crowded layouts.
-    let fill = if n == 1 { 1.0 } else { 0.9 };
     let fit_w = minimum.w + fill * (area.w - minimum.w);
     let fit_h = minimum.h + fill * (area.h - minimum.h);
 
     let b = bounds(&seed.rects);
     let mut hi = (area.w / b.w).min(area.h / b.h);
-    if params.max_scale > 0.0 {
-        hi = hi.min(params.max_scale);
+    if max_scale > 0.0 {
+        hi = hi.min(max_scale);
     }
     let mut lo = 0.0;
     // Constraint lengths grow monotonically with scale. Fit within the size
@@ -416,14 +488,7 @@ pub fn compute(items: &[Item], area: Rect, params: &Params) -> Vec<Rect> {
             hi = scale;
         }
     }
-    let mut out = trial;
-    seed.place(lo, gap, below, &mut out);
-    spread(&mut out, area);
-    // Footprints to thumbnails; exactly the scaled height, not a difference.
-    for (r, s) in out.iter_mut().zip(&seed.rects) {
-        r.h = s.h * lo;
-    }
-    out
+    lo
 }
 
 /// Index of the nearest rect from `rects[cur]` in direction `dir`.

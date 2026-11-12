@@ -186,7 +186,7 @@ fn snapshot() {
     for c in random_cases().take(300) {
         fingerprint(&compute(&c.items, c.area, &c.params), &mut hash);
     }
-    assert_eq!(hash, 0x4d54_1867_1736_572f, "layout output changed");
+    assert_eq!(hash, 0x4fb1_0a08_3fc8_8b59, "layout output changed");
 }
 
 #[test]
