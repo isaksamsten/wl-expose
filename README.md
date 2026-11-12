@@ -1,109 +1,78 @@
 # wl-expose
 
-A window overview ("exposé") for Wayland compositors, built as a
-layer-shell client on top of standard protocols. It aims to work on any
-compositor that supports these protocols (tested on umbriel; niri next).
+A window overview (like macOS Exposé) for Wayland. It shows your windows side by
+side with live previews, you pick one, and it prints that window's ID.
+
+It doesn't focus the window itself. You pair it with your compositor's IPC in a
+small script. It needs a compositor that supports the ext toplevel list and image
+capture protocols. I've tested it on umbriel, and niri should work too.
+
+## Usage
 
 ```sh
 wl-expose [OPTIONS] [ID...]
 ```
 
-wl-expose shows the given windows side by side in a full-screen overlay,
-lets you pick one, prints its ID to stdout and exits 0. Escape or a click on
-the background exits 1. It never focuses windows itself; a wrapper does that
-through the compositor's IPC. See [PLAN.md](PLAN.md) for the design.
+Pass the window IDs you want to show, or nothing to show all windows. If you pick
+one, its ID is printed and wl-expose exits 0. If you press Escape or click the
+background, it exits 1. `wl-expose --list` prints every window's ID, app ID and
+title.
 
-- `ID...` are ext toplevel identifiers (on umbriel and current upstream niri
-  these are also the IPC window IDs). No IDs means every window. Unknown IDs
-  are warned about and skipped; if nothing is left, it exits 1.
-- `--list` prints `identifier<TAB>app_id<TAB>title` for every window.
-
-Example niri wrapper (current workspace only):
+For example, this script shows the windows on the current niri workspace and
+focuses the one you pick:
 
 ```sh
 ws=$(niri msg -j workspaces | jq '.[] | select(.is_focused) | .id')
 ids=$(niri msg -j windows | jq -r ".[] | select(.workspace_id == $ws) | .id")
-id=$(wl-expose $ids) &&
-    niri msg action focus-window --id "$id"
+id=$(wl-expose $ids) && niri msg action focus-window --id "$id"
 ```
 
-Previews use natural window placement adapted from `native_win.js`: native-sized
-windows separate using aspect-aware dodges, then fit with a shared scale while
-reserving the `--gap` minimum in final logical pixels. Native size ratios are
-preserved without small-window boosts or a row fallback. Placement starts from a
-deterministic synthetic arrangement because desktop coordinates are unavailable.
-Some space is reserved for breathing room; centers spread gently and uniformly,
-preserving the composition rather than stretching it to the screen edges.
-The minimum gap is a floor, not a target to minimize. If it cannot fit the natural
-ordering even with zero-sized thumbnails, it is reduced with a warning to stderr.
-The layout is computed before display; there is no continuous physics simulation.
-If separation reaches its 500-pass limit, a warning is written to stderr and a
-deterministic sweep clears any remaining collisions before fitting.
-Placement doesn't depend on input order: windows are laid out sorted by their
-identifier, so the same set of windows always gets the same arrangement.
+### Controls
 
-## Controls
+- Mouse: hover to select, click to pick, click the background to cancel
+- Arrow keys or `hjkl`: move between windows
+- `Tab` / `Shift+Tab`: cycle through windows
+- `1`–`9`: pick a window by position
+- `Enter` picks, `Escape` cancels
 
-- Pointer: hover selects, left click picks, a click on the background cancels.
-- Arrows / `hjkl`: move to the nearest window in that direction.
-- `Tab` / `Shift+Tab`: cycle in input order.
-- `1`–`9`: pick the n-th window in input order.
-- `Enter` picks, `Escape` cancels.
-
-## Options
+### Options
 
 ```
   -l, --list              print identifier<TAB>app_id<TAB>title per window
-  -s, --select ID         start with this window selected (default: first ID)
-      --static            capture one frame per window (default: live)
-  -c, --cursors           paint cursors into thumbnails
-  -t, --timeout MS        max wait for window sizes before showing (500)
-      --config PATH       config file (default: see below); implies --no-daemon
-      --daemon            stay running and show the overlay for later calls
-      --no-daemon         show the overlay from this process even if a daemon runs
+  -s, --select ID         start with this window selected
+      --static            capture a single frame instead of live previews
+  -c, --cursors           draw cursors in the previews
+  -t, --timeout MS        how long to wait for window sizes (default 500)
+      --config PATH       use another config file (implies --no-daemon)
+      --daemon            run in the background for faster startup
+      --no-daemon         don't use a running daemon
 ```
 
 ## Daemon
 
-`wl-expose --daemon` keeps the Wayland connection, window list, config and
-decoded background image ready, so invocations skip all of that. Start it with
-the session, e.g. in niri:
+The overlay opens faster if you run `wl-expose --daemon` at login. In niri:
 
 ```kdl
 spawn-at-startup "wl-expose" "--daemon"
 ```
 
-Plain `wl-expose [OPTIONS] [ID...]` then hands its request to the daemon over
-`$XDG_RUNTIME_DIR/wl-expose-$WAYLAND_DISPLAY.sock` and prints the result and exits
-exactly as before, so wrappers don't change. Without a daemon it shows the
-overlay itself. Window captures still start fresh on every show.
-
-- Calling wl-expose while the overlay is open closes it (both calls exit 1),
-  so a single key binding toggles it.
-- Killing the waiting client cancels its overlay.
-- The daemon reloads the config and image when their files change (checked
-  on each show). An invalid config is reported to the client, and the
-  previous one is kept.
-- It exits when the compositor goes away.
+After that, `wl-expose` works the same as before but hands the request to the
+daemon. Running it while the overlay is open closes the overlay, so you can use one
+key binding to toggle it. The daemon reloads the config when the file changes.
 
 ## Configuration
 
-The config is read from `$XDG_CONFIG_HOME/wl-expose/config.toml` (usually
-`~/.config/wl-expose/config.toml`). A missing file means the defaults; every
-key is optional, and unknown keys are an error. Colors are `RRGGBB[AA]`, with
-or without a leading `#`.
-
-Layout and behavior keys go at the top level; colors and backgrounds go in
-`[appearance]`:
+The config file is `~/.config/wl-expose/config.toml`. All keys are optional.
+Colors are `RRGGBB` or `RRGGBBAA`. The defaults are:
 
 ```toml
-gap = 24                    # minimum space between thumbnails, px
-margin = 48                 # space around the layout, px; negative extends past the card
-zoom = 1.08                 # zoom factor of the selected thumbnail; 1 disables
-zoom-duration = 150         # zoom animation, ms; 0 is instant
-max-scale = 1.0             # max thumbnail scale
-open-duration = 400         # ms; 0 disables the opening transition
-card-scale = 0.9            # card size relative to the output
+gap = 24                    # minimum space between windows, px
+margin = 48                 # space around the layout, px
+zoom = 1.08                 # zoom on the selected window; 1 disables
+zoom-duration = 150         # ms
+max-scale = 1.0             # max preview scale
+open-duration = 400         # opening animation, ms; 0 disables
+card-scale = 0.9            # card size relative to the screen
 icon-size = 48              # px; 0 disables icons
 titles = true               # show the selected window's title
 font = "sans-serif"
@@ -111,21 +80,18 @@ font-size = 14
 
 [appearance]
 mode = "auto"               # "auto" (follow the desktop), "dark" or "light"
-background = "000000b3"     # overlay color; tints the image if one is set
-# background-image = "~/Pictures/wall.png"  # PNG, JPEG or WebP
-background-blur = 0         # px
+background = "000000b3"
+# background-image = "~/Pictures/wall.png"
+background-blur = 0
 card-color = "303030ff"
-placeholder = "3a3a3aff"    # color of windows without a thumbnail
-shadow-color = "00000077"   # alpha 0 disables shadows
-shadow-softness = 30        # shadow blur radius, px
-shadow-spread = 5           # px, may be negative
-shadow-offset = [0, 5]      # px
+placeholder = "3a3a3aff"    # shown for windows without a preview
+shadow-color = "00000077"
+shadow-softness = 30
+shadow-spread = 5
+shadow-offset = [0, 5]
 title-color = "ffffffff"
 title-background = "000000b3"
-# icon-theme = "Adwaita"    # default: the gsettings icon theme, then hicolor
-
-[appearance.dark]
-# any [appearance] key except mode; overrides it in dark mode
+# icon-theme = "Adwaita"
 
 [appearance.light]
 background = "ffffff80"
@@ -135,45 +101,15 @@ title-color = "000000ff"
 title-background = "ffffffb3"
 ```
 
-`[appearance.dark]` and `[appearance.light]` override keys of `[appearance]`
-in that color scheme. With `mode = "auto"`, the scheme is the desktop's
-(`color-scheme` from the settings portal, else gsettings; light if neither
-prefers dark). The daemon watches for changes (with a `gdbus monitor` or
-`gsettings monitor` child process), so a theme switch applies to the next
-overlay without asking the desktop on every show; it also loads the new
-`background-image` right away.
+Keys in `[appearance.dark]` and `[appearance.light]` override `[appearance]` for
+that color scheme. If you set a background image, `background` tints it. Set
+`background` to `00000000` to show the image without a tint.
 
-`background-image` is scaled to cover the output (centered, cropped to keep its
-aspect ratio) by the compositor. `~/` is expanded; relative paths are relative
-to the config file. Use a fully transparent `background` (`00000000`) to show the
-image untinted. If the image cannot be loaded, a warning is printed and the plain
-color is used.
-
-Shadows match niri's (CSS `box-shadow` semantics, same defaults) and are not
-drawn behind thumbnails, so translucent windows show the background.
-
-## Protocols
-
-- `ext_foreign_toplevel_list_v1`: window list (identifier, app_id, title)
-- `ext_foreign_toplevel_image_capture_source_manager_v1` +
-  `ext_image_copy_capture_manager_v1`: live thumbnails, into dmabufs
-  (`zwp_linux_dmabuf_v1` v3 + GBM) when possible, otherwise `wl_shm` buffers
-- `zwlr_layer_shell_v1`: the overlay surface
-- `wl_subcompositor` + `wp_viewporter`: one subsurface per thumbnail, scaled
-  by the compositor
-- `wp_single_pixel_buffer_manager_v1` (optional, falls back to 1x1 shm
-  buffers): background, placeholders; the background image and shadows are
-  plain `wl_shm` buffers
-- `wl_seat` + xkbcommon: input; `wp_cursor_shape_manager_v1` (optional)
-
-## Build
-
-Written in Rust on [smithay-client-toolkit](https://github.com/Smithay/client-toolkit)
-(SCTK), with protocol bindings from `wayland-protocols`.
+## Building
 
 ```sh
 cargo build --release
-cargo test
 ```
 
-Requires Rust 1.88 or newer, `libxkbcommon` and `libgbm`.
+You need Rust 1.88 or newer, plus `libxkbcommon` and `libgbm`.
+
