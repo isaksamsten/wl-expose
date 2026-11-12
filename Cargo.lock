@@ -1522,6 +1522,7 @@ dependencies = [
  "gbm",
  "image",
  "resvg",
+ "rustix",
  "serde",
  "smithay-client-toolkit",
  "toml",

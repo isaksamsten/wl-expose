@@ -14,7 +14,9 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::SystemTime;
 
-use smithay_client_toolkit::reexports::calloop::{Interest, Mode, PostAction, generic::Generic};
+use smithay_client_toolkit::reexports::calloop::{
+    Interest, LoopHandle, Mode, PostAction, generic::Generic,
+};
 use wayland_client::QueueHandle;
 
 use crate::app::{App, Outcome};
@@ -23,6 +25,7 @@ use crate::globals::Globals;
 use crate::ipc::{self, Reply, Request};
 use crate::options::Options;
 use crate::overlay::Wallpaper;
+use crate::scheme::DesktopScheme;
 use crate::{Error, Wayland};
 
 /// Requests are tiny; anything bigger is not a client.
@@ -85,7 +88,9 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
         g,
     } = crate::connect(true)?;
     let g = g.expect("overlay globals were requested");
-    appearance.refresh(&g, &qh, &mut |m| eprintln!("wl-expose: {m}"));
+    appearance.refresh(&g, &qh, &app.loop_handle, &mut |m| {
+        eprintln!("wl-expose: {m}")
+    });
     // Start the worker now, so fonts and icons are ready for the first show.
     app.prefetch_icons(&appearance.config);
 
@@ -138,7 +143,7 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
                     req,
                 } => {
                     let mut warn = |m: String| send(&stream, &Reply::Warn(m));
-                    if appearance.refresh(&g, &qh, &mut warn) {
+                    if appearance.refresh(&g, &qh, &app.loop_handle, &mut warn) {
                         // Icon size, theme or font may differ.
                         app.clear_icons();
                     }
@@ -171,6 +176,16 @@ pub fn run(opts: &Options) -> Result<ExitCode, Error> {
             }
             // Windows opened since are ready next time.
             app.prefetch_icons(&appearance.config);
+        }
+
+        // Follow a theme switch now, not on the next show: that would have
+        // to decode its background image first.
+        if active.is_none() && appearance.desktop.take_changed() {
+            let mut warn = |m: String| eprintln!("wl-expose: {m}");
+            if appearance.refresh(&g, &qh, &app.loop_handle, &mut warn) {
+                app.clear_icons();
+                app.prefetch_icons(&appearance.config);
+            }
         }
     }
 }
@@ -281,54 +296,66 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// The config and wallpaper, reloaded when their files change.
+/// The config and wallpaper, reloaded when their files change, and the
+/// desktop's color scheme.
 struct Appearance {
     /// `--config`, if given.
     explicit: Option<PathBuf>,
     config: Config,
     config_mtime: Option<SystemTime>,
+    desktop: DesktopScheme,
     wallpaper: Option<Rc<Wallpaper>>,
     /// The image path and mtime `wallpaper` was loaded from (or failed to).
     wallpaper_source: Option<(PathBuf, Option<SystemTime>)>,
 }
 
 impl Appearance {
+    /// Read the config; `refresh` applies the scheme and loads the image.
     fn load(explicit: Option<PathBuf>) -> Result<Self, String> {
-        let config = Config::load(explicit.as_deref())?;
+        let config = Config::read(explicit.as_deref())?;
         let config_mtime = Config::path(explicit.as_deref()).as_deref().and_then(mtime);
         Ok(Self {
             explicit,
             config,
             config_mtime,
+            desktop: DesktopScheme::default(),
             wallpaper: None,
             wallpaper_source: None,
         })
     }
 
-    /// Reload whatever changed. Errors keep the previous config, or show no
-    /// image, and are reported to `warn`. Returns whether the config changed.
+    /// Reload whatever changed and apply the desktop's color scheme. Errors
+    /// keep the previous config, or show no image, and are reported to
+    /// `warn`. Returns whether the config (or the scheme in use) changed.
     fn refresh(
         &mut self,
         g: &Globals,
         qh: &QueueHandle<App>,
+        handle: &LoopHandle<'static, App>,
         warn: &mut dyn FnMut(String),
     ) -> bool {
         let config_mtime = Config::path(self.explicit.as_deref())
             .as_deref()
             .and_then(mtime);
-        let mut changed = false;
+        let mut config = None;
         if config_mtime != self.config_mtime {
-            match Config::load(self.explicit.as_deref()) {
-                Ok(config) => {
-                    changed = config != self.config;
-                    self.config = config;
+            match Config::read(self.explicit.as_deref()) {
+                Ok(c) => {
+                    config = Some(c);
                     self.config_mtime = config_mtime;
                 }
                 Err(e) => warn(format!("config: {e} (keeping the previous config)")),
             }
         }
+        let mut config = config.unwrap_or_else(|| self.config.clone());
+        // Only watches the desktop if the config cares.
+        config
+            .appearance
+            .apply(|| self.desktop.get(handle, &mut *warn));
+        let changed = config != self.config;
+        self.config = config;
 
-        let source = self.config.background_image.clone().map(|path| {
+        let source = self.config.theme().background_image.clone().map(|path| {
             let mtime = mtime(&path);
             (path, mtime)
         });

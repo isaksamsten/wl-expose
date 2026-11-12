@@ -86,29 +86,60 @@ overlay itself. Window captures still start fresh on every show.
 
 ## Configuration
 
-Appearance is read from `$XDG_CONFIG_HOME/wl-expose/config.toml` (usually
+The config is read from `$XDG_CONFIG_HOME/wl-expose/config.toml` (usually
 `~/.config/wl-expose/config.toml`). A missing file means the defaults; every
 key is optional, and unknown keys are an error. Colors are `RRGGBB[AA]`, with
 or without a leading `#`.
 
+Layout and behavior keys go at the top level; colors and backgrounds go in
+`[appearance]`:
+
 ```toml
-background = "000000b3"     # overlay color; tints the image if one is set
-# background-image = "~/Pictures/wall.png"  # PNG, JPEG or WebP
-placeholder = "3a3a3aff"    # color of windows without a thumbnail
 gap = 24                    # minimum space between thumbnails, px
 margin = 48                 # space around the layout, px; negative extends past the card
 zoom = 1.08                 # zoom factor of the selected thumbnail; 1 disables
 zoom-duration = 150         # zoom animation, ms; 0 is instant
 max-scale = 1.0             # max thumbnail scale
+open-duration = 400         # ms; 0 disables the opening transition
+card-scale = 0.9            # card size relative to the output
+icon-size = 48              # px; 0 disables icons
+titles = true               # show the selected window's title
+font = "sans-serif"
+font-size = 14
+
+[appearance]
+mode = "auto"               # "auto" (follow the desktop), "dark" or "light"
+background = "000000b3"     # overlay color; tints the image if one is set
+# background-image = "~/Pictures/wall.png"  # PNG, JPEG or WebP
+background-blur = 0         # px
+card-color = "303030ff"
+placeholder = "3a3a3aff"    # color of windows without a thumbnail
 shadow-color = "00000077"   # alpha 0 disables shadows
 shadow-softness = 30        # shadow blur radius, px
 shadow-spread = 5           # px, may be negative
 shadow-offset = [0, 5]      # px
-open-duration = 400         # ms
-card-color = "303030ff"     #
-card-scale = 0.9
-background-blur = 0
+title-color = "ffffffff"
+title-background = "000000b3"
+# icon-theme = "Adwaita"    # default: the gsettings icon theme, then hicolor
+
+[appearance.dark]
+# any [appearance] key except mode; overrides it in dark mode
+
+[appearance.light]
+background = "ffffff80"
+card-color = "f0f0f0ff"
+placeholder = "d0d0d0ff"
+title-color = "000000ff"
+title-background = "ffffffb3"
 ```
+
+`[appearance.dark]` and `[appearance.light]` override keys of `[appearance]`
+in that color scheme. With `mode = "auto"`, the scheme is the desktop's
+(`color-scheme` from the settings portal, else gsettings; light if neither
+prefers dark). The daemon watches for changes (with a `gdbus monitor` or
+`gsettings monitor` child process), so a theme switch applies to the next
+overlay without asking the desktop on every show; it also loads the new
+`background-image` right away.
 
 `background-image` is scaled to cover the output (centered, cropped to keep its
 aspect ratio) by the compositor. `~/` is expanded; relative paths are relative

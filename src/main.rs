@@ -13,6 +13,7 @@ mod ipc;
 mod layout;
 mod options;
 mod overlay;
+mod scheme;
 mod shadow;
 mod text;
 mod toplevel;
@@ -141,7 +142,7 @@ fn run(opts: &Options) -> Result<ExitCode, Error> {
     };
 
     // A broken image is not worth failing over: fall back to the color.
-    let wallpaper = config.background_image.as_deref().and_then(|path| {
+    let wallpaper = config.theme().background_image.as_deref().and_then(|path| {
         load_wallpaper(path, &g, &qh)
             .inspect_err(|e| eprintln!("wl-expose: {e}"))
             .ok()

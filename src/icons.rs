@@ -36,7 +36,7 @@ impl Key {
         Self {
             app_id: app_id.to_string(),
             size: config.icon_size * scale.max(1) as u32,
-            theme: config.icon_theme.clone(),
+            theme: config.theme().icon_theme.clone(),
         }
     }
 }

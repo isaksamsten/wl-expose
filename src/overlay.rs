@@ -667,10 +667,11 @@ impl Overlay {
         assets: Rc<Assets>,
         qh: &QueueHandle<App>,
     ) -> std::io::Result<Self> {
-        let background = color_buffer(&g, over_black(config.background), qh)?;
-        let card_color = color_buffer(&g, config.card_color, qh)?;
+        let theme = config.theme();
+        let background = color_buffer(&g, over_black(theme.background), qh)?;
+        let card_color = color_buffer(&g, theme.card_color, qh)?;
         let transparent = color_buffer(&g, 0, qh)?;
-        let placeholder = color_buffer(&g, config.placeholder, qh)?;
+        let placeholder = color_buffer(&g, theme.placeholder, qh)?;
         // Copied by set_input_region, so it is destroyed at the end of new().
         let no_input = Region::new(&g.compositor).map_err(std::io::Error::other)?;
 
@@ -799,13 +800,13 @@ impl Overlay {
                 max_scale: config.max_scale,
                 shadow,
                 icon_size: config.icon_size as i32,
-                icon_theme: config.icon_theme.clone(),
+                icon_theme: theme.icon_theme.clone(),
                 font: config.font.clone(),
                 title,
                 open_duration: Duration::from_millis(config.open_duration.into()),
                 card_scale: config.card_scale,
-                background: config.background,
-                background_blur: config.background_blur,
+                background: theme.background,
+                background_blur: theme.background_blur,
             },
             width: 0,
             height: 0,
