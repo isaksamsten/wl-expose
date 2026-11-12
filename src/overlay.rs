@@ -2,11 +2,14 @@
 //! subsurface per window thumbnail on it.
 //!
 //! The main surface shows the background color, or the background image
-//! blurred and tinted with it. Above it are the card's shadow and the card,
-//! which first shows a screenshot of the output at full size, shrinks all the
-//! way into place over the blurred background, and then shows the background
-//! image (or the card color). Everything else is in `content`, a transparent
-//! subsurface that hides it all until the thumbnails start sliding in.
+//! blurred and tinted with it. Above it are the card's shadow, the card,
+//! which shows the background image (or the card color), and over the card
+//! a screenshot of the output. The two start at full size and shrink all the
+//! way into place over the blurred background. Everything else is in
+//! `content`, a transparent subsurface that hides it all until the
+//! thumbnails start spreading out. With wp_alpha_modifier_v1, that starts
+//! early in the shrink, as the screenshot fades out and the thumbnails fade
+//! in; otherwise the screenshot disappears at once near its end.
 //!
 //! Colors are single-pixel buffers (or 1x1 shm buffers if the compositor
 //! lacks wp_single_pixel_buffer_manager_v1) scaled with viewports;
@@ -45,7 +48,10 @@ use wayland_client::{
 };
 use wayland_protocols::{
     ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
-    wp::viewporter::client::wp_viewport::WpViewport,
+    wp::{
+        alpha_modifier::v1::client::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
+        viewporter::client::wp_viewport::WpViewport,
+    },
 };
 
 use crate::app::App;
@@ -99,6 +105,8 @@ struct Sub {
     surface: WlSurface,
     subsurface: WlSubsurface,
     viewport: WpViewport,
+    /// While it is faded in or out.
+    alpha: Option<WpAlphaModifierSurfaceV1>,
 }
 
 impl Sub {
@@ -111,6 +119,34 @@ impl Sub {
             surface,
             subsurface,
             viewport,
+            alpha: None,
+        }
+    }
+
+    /// Start fading: show it at `a` (0 to 1) from the next commit. False
+    /// without wp_alpha_modifier_v1.
+    fn start_fade(&mut self, g: &Globals, a: f64, qh: &QueueHandle<App>) -> bool {
+        let Some(manager) = &g.alpha_modifier else {
+            return false;
+        };
+        if self.alpha.is_none() {
+            self.alpha = Some(manager.get_surface(&self.surface, qh, Ignore));
+        }
+        self.set_alpha(a);
+        true
+    }
+
+    /// Show it at `a` (0 to 1) from the next commit, while fading.
+    fn set_alpha(&self, a: f64) {
+        if let Some(alpha) = &self.alpha {
+            alpha.set_multiplier((a.clamp(0.0, 1.0) * u32::MAX as f64).round() as u32);
+        }
+    }
+
+    /// Stop fading: fully opaque again from the next commit.
+    fn end_fade(&mut self) {
+        if let Some(alpha) = self.alpha.take() {
+            alpha.destroy();
         }
     }
 
@@ -127,6 +163,8 @@ impl Sub {
 
 impl Drop for Sub {
     fn drop(&mut self) {
+        // Before the surface, or it is a protocol error.
+        self.end_fade();
         self.viewport.destroy();
         self.subsurface.destroy();
         self.surface.destroy();
@@ -526,21 +564,12 @@ impl Drop for Wallpaper {
     }
 }
 
-/// The output screenshot the card starts as.
+/// The output screenshot the card starts covered by.
 struct Screenshot {
     id: WindowId,
     capture: Capture,
     /// The frame, once captured: its buffer (owned by `capture`) and transform.
     frame: Option<(WlBuffer, Transform)>,
-}
-
-/// What the card shows.
-#[derive(Clone, Copy, PartialEq)]
-enum CardShows {
-    Nothing,
-    Screenshot,
-    /// The background image, or the card color without one.
-    Wallpaper,
 }
 
 /// The opening transition, started at `start`.
@@ -552,16 +581,23 @@ struct Opening {
     /// The card starts as the screenshot at full output size and shrinks;
     /// otherwise only the thumbnails slide in.
     shrink: bool,
+    /// The screenshot fades out as the thumbnails fade in, with
+    /// wp_alpha_modifier_v1; otherwise they swap at once.
+    crossfade: bool,
 }
 
 /// The share of `open-duration` the card takes to shrink into place, as the
 /// screenshot over the blurred background; the thumbnails then slide in over
 /// the rest of it, on the wallpaper.
 const SHRINK_SHARE: f64 = 0.4;
-/// The share of the shrink still left when the card swaps to the wallpaper
-/// and the thumbnails start spreading: eased out, the card has nearly
-/// arrived by then and finishes under them.
+/// Without a crossfade, the share of the shrink still left when the
+/// screenshot disappears and the thumbnails start spreading: eased out, the
+/// card has nearly arrived by then and finishes under them.
 const SPREAD_OVERLAP: f64 = 0.4;
+/// With a crossfade, the share of the shrink after which the screenshot
+/// starts fading out to the wallpaper and the thumbnails start fading in and
+/// spreading; the fade is done when the card arrives.
+const FADE_START: f64 = 0.2;
 /// How far toward the center of the content the thumbnails start, as a
 /// share of their distance to it (1 = all start at the center), and how
 /// small they start; they spread outward to their places.
@@ -572,6 +608,12 @@ const SLIDE_SCALE: f64 = 0.8;
 fn ease_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
+}
+
+/// Ease in and out (smoothstep), `t` clamped to 0..=1.
+fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// How far along an animation of `duration` is after `elapsed`, 0 to 1.
@@ -594,11 +636,13 @@ pub struct Overlay {
     /// The parent of every window's subsurfaces and the pill: a transparent
     /// pixel that hides them all until it is attached.
     content: Sub,
-    /// The card: the screenshot, then the wallpaper.
+    /// The card: the wallpaper, or the card color without one.
     card: Sub,
+    /// Over the card, the same size: the screenshot during the opening.
+    card_shot: Sub,
     /// None with shadows disabled.
     card_shadow: Option<Shadow>,
-    /// Until the card shows the wallpaper; None without one.
+    /// Until it has faded out; None without one.
     screenshot: Option<Screenshot>,
     viewport: WpViewport,
     layer: LayerSurface,
@@ -640,7 +684,6 @@ pub struct Overlay {
     /// Where thumbnails and pills may go: the card, grown by a negative
     /// margin, within the output.
     content_rect: IRect,
-    card_shows: CardShows,
     /// `content` is attached.
     content_shown: bool,
     /// The running opening transition, if any.
@@ -690,13 +733,14 @@ impl Overlay {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
 
-        // Stacking is creation order: the card's shadow, the card, then
-        // everything else in `content`.
+        // Stacking is creation order: the card's shadow, the card, the
+        // screenshot over it, then everything else in `content`.
         let shadow = config.shadow();
         let card_shadow = shadow
             .is_some()
             .then(|| Shadow::new(&g, layer.wl_surface(), &no_input, qh));
         let card = Sub::new(&g, layer.wl_surface(), &no_input, qh);
+        let card_shot = Sub::new(&g, layer.wl_surface(), &no_input, qh);
         let content = Sub::new(&g, layer.wl_surface(), &no_input, qh);
         content.place(IRect {
             x: 0,
@@ -776,6 +820,7 @@ impl Overlay {
             stack_top,
             content,
             card,
+            card_shot,
             card_shadow,
             screenshot,
             viewport,
@@ -818,7 +863,6 @@ impl Overlay {
             frame_pending: false,
             card_rect: IRect::default(),
             content_rect: IRect::default(),
-            card_shows: CardShows::Nothing,
             content_shown: false,
             opening: None,
             shrink: 1.0,
@@ -892,50 +936,91 @@ impl Overlay {
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
     }
 
-    /// Attach what the card shows. Committed by `place_card`.
+    /// Attach the card's buffer: the wallpaper, cropped like the output, or
+    /// the card color. Committed by `place_card`.
     fn attach_card(&self) {
         let card = &self.card;
-        match self.card_shows {
-            CardShows::Nothing => {}
-            CardShows::Screenshot => {
-                if let Some((buffer, transform)) =
-                    self.screenshot.as_ref().and_then(|s| s.frame.as_ref())
-                {
-                    card.surface.set_buffer_transform(*transform);
-                    card.attach(buffer);
-                }
+        match &self.wallpaper {
+            Some(wp) if self.width > 0 && self.height > 0 => {
+                // Cropped like the output, which the card's shape is.
+                let (x, y, w, h) = wp.cover(self.width, self.height);
+                card.viewport.set_source(x, y, w, h);
+                card.attach(&wp.buffer);
             }
-            CardShows::Wallpaper => {
-                card.surface.set_buffer_transform(Transform::Normal);
-                match &self.wallpaper {
-                    Some(wp) if self.width > 0 && self.height > 0 => {
-                        // Cropped like the output, which the card's shape is.
-                        let (x, y, w, h) = wp.cover(self.width, self.height);
-                        card.viewport.set_source(x, y, w, h);
-                        card.attach(&wp.buffer);
-                    }
-                    _ => {
-                        card.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
-                        card.attach(&self.card_color);
-                    }
-                }
+            _ => {
+                card.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+                card.attach(&self.card_color);
             }
         }
     }
 
-    /// The card shows the wallpaper from now on; the screenshot is released.
-    fn swap_card(&mut self) {
-        if self.card_shows == CardShows::Wallpaper {
+    /// Attach the screenshot over the card. Committed by `place_card`.
+    fn attach_shot(&self) {
+        if let Some((buffer, transform)) = self.screenshot.as_ref().and_then(|s| s.frame.as_ref())
+        {
+            self.card_shot.surface.set_buffer_transform(*transform);
+            self.card_shot.attach(buffer);
+        }
+    }
+
+    /// Every subsurface in `content` that shows something.
+    fn content_subs(&mut self) -> impl Iterator<Item = &mut Sub> {
+        let windows = self.windows.iter_mut().flat_map(|w| {
+            std::iter::once(&mut w.sub)
+                .chain(w.shadow.iter_mut().flat_map(|s| s.strips.iter_mut()))
+                .chain(w.icon.iter_mut().map(|i| &mut i.sub))
+        });
+        windows.chain(self.pill_sub.iter_mut())
+    }
+
+    /// Start the crossfade from the screenshot to the thumbnails: false
+    /// without wp_alpha_modifier_v1.
+    fn start_crossfade(&mut self) -> bool {
+        let g = self.g.clone();
+        let qh = self.qh.clone();
+        if !self.card_shot.start_fade(&g, 1.0, &qh) {
+            return false;
+        }
+        for sub in self.content_subs() {
+            sub.start_fade(&g, 0.0, &qh);
+        }
+        true
+    }
+
+    /// Crossfade `t` of the way (0 to 1) from the screenshot to the
+    /// wallpaper and the thumbnails, or without a crossfade, swap at 1. The
+    /// screenshot is committed by `place_card`, the windows by
+    /// `place_window`.
+    fn crossfade(&mut self, t: f64) {
+        if self.screenshot.is_none() {
             return;
         }
-        self.card_shows = CardShows::Wallpaper;
-        self.attach_card();
-        self.card.surface.commit();
-        // Attached buffers may be destroyed; the card keeps its contents
-        // until the new buffer applies.
+        if t >= 1.0 {
+            self.release_shot();
+            for sub in self.content_subs() {
+                sub.end_fade();
+            }
+        } else {
+            self.card_shot.set_alpha(1.0 - t);
+            for sub in self.content_subs() {
+                sub.set_alpha(t);
+            }
+        }
+        if let Some(sub) = &self.pill_sub {
+            sub.surface.commit();
+        }
+    }
+
+    /// Hide the screenshot and release it.
+    fn release_shot(&mut self) {
+        self.card_shot.surface.attach(None, 0, 0);
+        self.card_shot.end_fade();
+        self.card_shot.surface.commit();
+        // Attached buffers may be destroyed; the surface keeps its contents
+        // until the detach applies.
         self.screenshot = None;
         if let Some(t0) = self.trace {
-            trace(t0, format_args!("card swapped to the wallpaper"));
+            trace(t0, format_args!("screenshot gone, card shows the wallpaper"));
         }
     }
 
@@ -974,6 +1059,8 @@ impl Overlay {
         let shown = self.card_shown_rect();
         self.card.place(shown);
         self.card.surface.commit();
+        self.card_shot.place(shown);
+        self.card_shot.surface.commit();
         if let Some(sh) = &self.card_shadow {
             sh.place(self.card_rect, shown);
         }
@@ -1038,7 +1125,19 @@ impl Overlay {
             return;
         }
 
-        let items: Vec<layout::Item> = self.windows.iter().map(|w| w.size(self.scale)).collect();
+        // Lay out in a canonical order, not the order the windows were passed
+        // in (which may be e.g. most recently used), so the same windows always
+        // get the same placement. The window order itself (selection, cycling)
+        // is left alone.
+        let mut order: Vec<usize> = (0..self.windows.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (a, b) = (&self.windows[a], &self.windows[b]);
+            (&a.identifier, &a.app_id, &a.title).cmp(&(&b.identifier, &b.app_id, &b.title))
+        });
+        let items: Vec<layout::Item> = order
+            .iter()
+            .map(|&i| self.windows[i].size(self.scale))
+            .collect();
         let params = layout::Params {
             spacing: self.style.gap,
             max_scale: self.style.max_scale,
@@ -1046,7 +1145,8 @@ impl Overlay {
         };
         let rects = layout::compute(&items, area, &params);
 
-        for (win, r) in self.windows.iter_mut().zip(rects) {
+        for (&i, r) in order.iter().zip(rects) {
+            let win = &mut self.windows[i];
             // Round edges rather than sizes so neighbors never overlap.
             let (x0, y0) = (r.x.round() as i32, r.y.round() as i32);
             let (x1, y1) = ((r.x + r.w).round() as i32, (r.y + r.h).round() as i32);
@@ -1157,9 +1257,10 @@ impl Overlay {
         }
     }
 
-    /// Advance the opening transition to `now`: shrink the card, and near
-    /// the end of it swap it to the wallpaper, show the windows and spread
-    /// them out while the card settles. Returns whether it is still running.
+    /// Advance the opening transition to `now`: shrink the card, and on the
+    /// way crossfade from the screenshot on it to the wallpaper and the
+    /// windows, which spread out while the card settles. Returns whether it
+    /// is still running.
     fn animate_opening(&mut self, now: Instant) -> bool {
         let Some(o) = self.opening else {
             return false;
@@ -1175,14 +1276,28 @@ impl Overlay {
         };
         let card = progress(elapsed, shrink_time);
         self.shrink = ease_out(card);
-        let spread_start = shrink_time.mul_f64(1.0 - SPREAD_OVERLAP);
+        let spread_start = if o.crossfade {
+            shrink_time.mul_f64(FADE_START)
+        } else {
+            shrink_time.mul_f64(1.0 - SPREAD_OVERLAP)
+        };
         let started = elapsed >= spread_start;
         if started {
-            // The card is (nearly) in place: its contents change, and the
-            // windows start moving.
-            self.swap_card();
+            // The windows start fading in (or appear) and moving.
             self.show_content();
         }
+        let fade = if o.crossfade {
+            let t = progress(
+                elapsed.saturating_sub(spread_start),
+                shrink_time.saturating_sub(spread_start),
+            );
+            smoothstep(t)
+        } else if started {
+            1.0
+        } else {
+            0.0
+        };
+        self.crossfade(fade);
         let slide_time = duration.saturating_sub(spread_start);
         let slide = progress(elapsed.saturating_sub(spread_start), slide_time);
         self.slide = if started { ease_out(slide) } else { 0.0 };
@@ -1605,21 +1720,23 @@ impl Overlay {
         }
         self.attach_background();
         let animated = !self.style.open_duration.is_zero();
+        // The thumbnails start transparent, to fade in.
+        let crossfade = shrink && animated && self.start_crossfade();
         self.opening = animated.then_some(Opening {
             start: None,
             shrink,
+            crossfade,
         });
         if shrink {
-            // The screen looks unchanged: the card covers the output.
-            self.card_shows = CardShows::Screenshot;
+            // The screen looks unchanged: the screenshot covers the output.
             (self.shrink, self.slide) = (0.0, 0.0);
         } else {
-            self.card_shows = CardShows::Wallpaper;
             self.shrink = 1.0;
             self.slide = if animated { 0.0 } else { 1.0 };
             self.show_content();
         }
         self.attach_card();
+        self.attach_shot();
         self.relayout(); // commits the parent, mapping it
     }
 

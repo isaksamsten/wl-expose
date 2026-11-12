@@ -20,6 +20,10 @@ use wayland_protocols::{
         image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
     },
     wp::{
+        alpha_modifier::v1::client::{
+            wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
+            wp_alpha_modifier_v1::WpAlphaModifierV1,
+        },
         linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
@@ -54,6 +58,8 @@ ignore_events!(
     WpViewporter,
     WpViewport,
     WpSinglePixelBufferManagerV1,
+    WpAlphaModifierV1,
+    WpAlphaModifierSurfaceV1,
     ExtForeignToplevelImageCaptureSourceManagerV1,
     ExtImageCaptureSourceV1,
     ExtOutputImageCaptureSourceManagerV1,
@@ -80,6 +86,9 @@ pub struct Globals {
     pub viewporter: WpViewporter,
     /// Optional; falls back to 1x1 shm buffers.
     pub single_pixel: Option<WpSinglePixelBufferManagerV1>,
+    /// Optional; without it, the card swaps from the screenshot to the
+    /// wallpaper instead of crossfading.
+    pub alpha_modifier: Option<WpAlphaModifierV1>,
     pub layer_shell: LayerShell,
     pub source_manager: ExtForeignToplevelImageCaptureSourceManagerV1,
     pub copy_manager: ExtImageCopyCaptureManagerV1,
@@ -130,6 +139,7 @@ impl Globals {
             shm: Shm(shm?),
             viewporter: viewporter?,
             single_pixel: globals.bind(qh, 1..=1, Ignore).ok(),
+            alpha_modifier: globals.bind(qh, 1..=1, Ignore).ok(),
             layer_shell: layer_shell?,
             source_manager: source_manager?,
             copy_manager: copy_manager?,

@@ -39,6 +39,8 @@ ordering even with zero-sized thumbnails, it is reduced with a warning to stderr
 The layout is computed before display; there is no continuous physics simulation.
 If separation reaches its 500-pass limit, a warning is written to stderr and a
 deterministic sweep clears any remaining collisions before fitting.
+Placement doesn't depend on input order: windows are laid out sorted by their
+identifier, so the same set of windows always gets the same arrangement.
 
 ## Controls
 
